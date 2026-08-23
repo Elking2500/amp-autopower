@@ -1,6 +1,6 @@
 {
-  "version": "1.1.1",
-  "package_url": "https://github.com/Elking2500/amp-autopower/releases/download/v1.1.1/AMP-AutoPower-CachyOS-v1.1.1.tar.gz",
-  "sha256": "1e80e17f3c83b4cfa92ce9b8becd5b8068773c21a9d3cad8c787c673cb6a9f7a",
-  "notes": "AMP AutoPower v1.1.1: canal oficial de actualizaciones mediante GitHub, comprobación automática cada 48 horas y verificación SHA-256."
+  "version": "1.2.1",
+  "package_url": "https://github.com/Elking2500/amp-autopower/releases/download/v1.2.1/AMP-AutoPower-CachyOS-v1.2.1.tar.gz",
+  "sha256": "58b2f8f4f26408062949d7980eb3730b5ae356fd07df5ca70fb3803366790b72",
+  "notes": "AMP AutoPower v1.2.1: overlay de emergencia sobre juegos fullscreen, detección global de inactividad para mouse, teclado y mandos USB/Bluetooth/wireless, compatibilidad con python-evdev 1.9.x y protección contra falsa actividad de sensores de movimiento."
 }
