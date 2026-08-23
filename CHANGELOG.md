@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.3.0
+
+- Nuevo modo de programación exclusivamente por inactividad, sin hora fija.
+- La hora programada puede activarse o desactivarse individualmente para cada programación.
+- Las programaciones por inactividad se rearman únicamente después de nueva actividad.
+- Posponer una acción por inactividad sigue funcionando; si el usuario vuelve a usar la PC, comienza un ciclo nuevo.
+- Nueva opción para cerrar correctamente las aplicaciones antes de apagar o reiniciar.
+- El cierre seguro utiliza `org.kde.Shutdown.logoutAndShutdown` y `logoutAndReboot` de Plasma.
+- Google Chrome recibe una solicitud de salida limpia antes del cierre de Plasma para conservar correctamente ventanas y pestañas.
+- AMP AutoPower solo envía la señal de cierre a los procesos principales de Google Chrome, nunca a renderer, GPU, utility o zygote.
+- Si Chrome no termina correctamente en 15 segundos, AMP AutoPower cancela el apagado/reinicio en lugar de forzar su cierre.
+- El servicio espera a que el socket de Wayland esté disponible durante el inicio de sesión, evitando abortos/core dumps de Qt al arrancar demasiado pronto.
+- El actualizador instala primero la nueva versión, muestra la confirmación de instalación y reinicia AMP AutoPower únicamente después de que el usuario pulse OK.
+
 ## 1.2.2
 
 - Corregida la búsqueda de actualizaciones que podía tardar ~60 segundos con urllib e IPv6.

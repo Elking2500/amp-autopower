@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import signal
 import re
 import select
 import socket
@@ -40,7 +41,7 @@ except Exception:
 
 APP_NAME = "AMP AutoPower"
 APP_ID = "amp-autopower"
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.3.0"
 IPC_NAME = "amp-autopower-ipc-v1"
 CONFIG_DIR = Path.home() / ".config" / APP_ID
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -174,6 +175,7 @@ class Schedule:
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     name: str = "Apagado nocturno"
     enabled: bool = True
+    use_time: bool = True
     time: str = "23:30"
     weekdays: list = field(default_factory=lambda: [0, 1, 2, 3, 4, 5, 6])
     action: str = "poweroff"
@@ -181,6 +183,7 @@ class Schedule:
     final_countdown_seconds: int = 60
     require_idle: bool = False
     idle_minutes: int = 30
+    close_apps_first: bool = True
 
 
 DEFAULT_CONFIG = {
@@ -492,7 +495,15 @@ class OverlayPage(QWidget):
         lay = QVBoxLayout(card); lay.setContentsMargins(28,28,28,28)
         self.title = QLabel(); self.title.setAlignment(Qt.AlignCenter); self.title.setStyleSheet("font-size:34px;font-weight:900;")
         lay.addWidget(self.title)
-        desc = QLabel(f"Acción programada: <b>{ACTIONS.get(schedule.action, schedule.action)}</b><br>Horario original: <b>{schedule.time}</b><br><br>Este aviso está diseñado para mostrarse sobre aplicaciones y juegos a pantalla completa.")
+        if getattr(schedule, "use_time", True):
+            trigger_text = f"Hora programada: <b>{schedule.time}</b>"
+        else:
+            trigger_text = f"Activada tras <b>{schedule.idle_minutes} min de inactividad</b>"
+        desc = QLabel(
+            f"Acción programada: <b>{ACTIONS.get(schedule.action, schedule.action)}</b><br>"
+            f"{trigger_text}<br><br>"
+            "Este aviso está diseñado para mostrarse sobre aplicaciones y juegos a pantalla completa."
+        )
         desc.setAlignment(Qt.AlignCenter); desc.setWordWrap(True); desc.setStyleSheet("font-size:18px;"); lay.addWidget(desc)
         row = QHBoxLayout()
         for text, action in (("Cancelar esta vez","cancel"),("Posponer 10 min","snooze10"),("Posponer 30 min","snooze30")):
@@ -551,91 +562,181 @@ class ScheduleEditor(QDialog):
     def __init__(self, parent=None, schedule=None):
         super().__init__(parent)
         self.setWindowTitle("Editar programación")
-        self.resize(520, 460)
+        self.resize(590, 580)
         self.original = schedule
         s = schedule or Schedule()
 
         root = QVBoxLayout(self)
         form = QFormLayout()
+
         self.name = QLineEdit(s.name)
+
         self.enabled = QCheckBox("Activa")
         self.enabled.setChecked(s.enabled)
+
+        self.use_time = QCheckBox("Usar hora programada")
+        self.use_time.setChecked(getattr(s, "use_time", True))
+
         self.time = QTimeEdit(QTime.fromString(s.time, "HH:mm"))
         self.time.setDisplayFormat("HH:mm")
+
         self.action = QComboBox()
         for key, text in ACTIONS.items():
             self.action.addItem(text, key)
         idx = self.action.findData(s.action)
         self.action.setCurrentIndex(max(0, idx))
+
         self.countdown = QSpinBox()
         self.countdown.setRange(15, 600)
         self.countdown.setSuffix(" s")
         self.countdown.setValue(s.final_countdown_seconds)
+
         self.require_idle = QCheckBox("Solo ejecutar cuando no haya actividad")
-        self.require_idle.setChecked(getattr(s, "require_idle", False))
+        self.require_idle.setChecked(
+            getattr(s, "require_idle", False)
+            or not getattr(s, "use_time", True)
+        )
+
         self.idle_minutes = QSpinBox()
         self.idle_minutes.setRange(1, 720)
         self.idle_minutes.setSuffix(" min")
-        self.idle_minutes.setValue(max(1, int(getattr(s, "idle_minutes", 30))))
-        self.idle_minutes.setEnabled(self.require_idle.isChecked())
-        self.require_idle.toggled.connect(self.idle_minutes.setEnabled)
+        self.idle_minutes.setValue(
+            max(1, int(getattr(s, "idle_minutes", 30)))
+        )
+
+        self.close_apps = QCheckBox(
+            "Cerrar aplicaciones correctamente antes de apagar/reiniciar"
+        )
+        self.close_apps.setChecked(
+            getattr(s, "close_apps_first", True)
+        )
 
         form.addRow("Nombre:", self.name)
         form.addRow("Estado:", self.enabled)
+        form.addRow("Horario:", self.use_time)
         form.addRow("Hora:", self.time)
         form.addRow("Acción:", self.action)
         form.addRow("Cuenta regresiva final:", self.countdown)
         form.addRow("Inactividad:", self.require_idle)
         form.addRow("Tiempo mínimo inactivo:", self.idle_minutes)
+        form.addRow("Cierre seguro:", self.close_apps)
+
         root.addLayout(form)
 
         days_box = QGroupBox("Días de la semana")
         days_layout = QGridLayout(days_box)
+
         self.days = []
         for i, d in enumerate(WEEKDAYS):
             c = QCheckBox(d)
             c.setChecked(i in s.weekdays)
             self.days.append(c)
             days_layout.addWidget(c, i // 4, i % 4)
+
         root.addWidget(days_box)
 
-        warn_box = QGroupBox("Avisos previos")
-        warn_layout = QHBoxLayout(warn_box)
+        self.warn_box = QGroupBox("Avisos previos para horario programado")
+        warn_layout = QHBoxLayout(self.warn_box)
+
         self.warn30 = QCheckBox("30 min")
         self.warn15 = QCheckBox("15 min")
         self.warn5 = QCheckBox("5 min")
         self.warn1 = QCheckBox("1 min")
-        for w, val in [(self.warn30, 30), (self.warn15, 15), (self.warn5, 5), (self.warn1, 1)]:
+
+        for w, val in [
+            (self.warn30, 30),
+            (self.warn15, 15),
+            (self.warn5, 5),
+            (self.warn1, 1),
+        ]:
             w.setChecked(val in s.warning_minutes)
             warn_layout.addWidget(w)
-        root.addWidget(warn_box)
 
-        note = QLabel("El aviso final abre una ventana por encima de las demás con opciones para cancelar o posponer.")
+        root.addWidget(self.warn_box)
+
+        note = QLabel(
+            "Si desactivas «Usar hora programada», la acción podrá "
+            "ejecutarse a cualquier hora de los días seleccionados cuando "
+            "se alcance el tiempo de inactividad. En ese modo la inactividad "
+            "es obligatoria.\n\n"
+            "El cierre seguro de aplicaciones se usa para Apagar y Reiniciar "
+            "mediante la sesión de Plasma, evitando matar los programas a la fuerza."
+        )
         note.setWordWrap(True)
         root.addWidget(note)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Save | QDialogButtonBox.Cancel
+        )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
+        self.use_time.toggled.connect(self._refresh_mode_controls)
+        self.require_idle.toggled.connect(self._refresh_mode_controls)
+        self.action.currentIndexChanged.connect(self._refresh_action_controls)
+
+        self._refresh_mode_controls()
+        self._refresh_action_controls()
+
+    def _refresh_mode_controls(self):
+        timed = self.use_time.isChecked()
+
+        self.time.setEnabled(timed)
+        self.warn_box.setEnabled(timed)
+
+        if not timed:
+            self.require_idle.setChecked(True)
+            self.require_idle.setEnabled(False)
+            self.idle_minutes.setEnabled(True)
+        else:
+            self.require_idle.setEnabled(True)
+            self.idle_minutes.setEnabled(self.require_idle.isChecked())
+
+    def _refresh_action_controls(self):
+        action = self.action.currentData()
+        self.close_apps.setEnabled(action in ("poweroff", "reboot"))
+
     def get_schedule(self):
         warns = []
-        for w, val in [(self.warn30, 30), (self.warn15, 15), (self.warn5, 5), (self.warn1, 1)]:
+
+        for w, val in [
+            (self.warn30, 30),
+            (self.warn15, 15),
+            (self.warn5, 5),
+            (self.warn1, 1),
+        ]:
             if w.isChecked():
                 warns.append(val)
-        weekdays = [i for i, c in enumerate(self.days) if c.isChecked()]
+
+        weekdays = [
+            i for i, c in enumerate(self.days)
+            if c.isChecked()
+        ]
+
+        use_time = self.use_time.isChecked()
+        action = self.action.currentData()
+
         return Schedule(
             id=self.original.id if self.original else str(uuid.uuid4()),
             name=self.name.text().strip() or "Programación",
             enabled=self.enabled.isChecked(),
+            use_time=use_time,
             time=self.time.time().toString("HH:mm"),
             weekdays=weekdays,
-            action=self.action.currentData(),
+            action=action,
             warning_minutes=sorted(warns, reverse=True),
             final_countdown_seconds=self.countdown.value(),
-            require_idle=self.require_idle.isChecked(),
+            require_idle=(
+                True if not use_time
+                else self.require_idle.isChecked()
+            ),
             idle_minutes=self.idle_minutes.value(),
+            close_apps_first=(
+                self.close_apps.isChecked()
+                if action in ("poweroff", "reboot")
+                else False
+            ),
         )
 
 
@@ -651,6 +752,20 @@ class MainWindow(QMainWindow):
         self.download_thread = None
         self.download_dialog = None
         self.available_update = self.state.get("available_update")
+
+        # Control del instalador que espera al OK antes de reiniciar.
+        self.install_process = None
+        self.install_progress = None
+        self.pending_update_version = None
+        self.install_poll_timer = QTimer(self)
+        self.install_poll_timer.timeout.connect(self._poll_update_install)
+
+        # Cada movimiento/pulsación crea una nueva generación de actividad.
+        # Las programaciones solo-inactividad se ejecutan una vez por ciclo.
+        self.activity_generation = 0
+        self.idle_triggered_generation = {}
+        self.idle_snooze_generation = {}
+
         self.last_activity_monotonic = time.monotonic()
         self.last_activity_device = "inicio de AMP AutoPower"
         self.input_monitor_status = {"backend":"evdev","available":evdev is not None,"accessible":0,"denied":0,"total":0,"devices":[]}
@@ -877,7 +992,9 @@ class MainWindow(QMainWindow):
         self.refresh_activity_label()
 
     def on_input_activity(self, device_name):
-        self.last_activity_monotonic = time.monotonic(); self.last_activity_device = device_name or "dispositivo de entrada"
+        self.last_activity_monotonic = time.monotonic()
+        self.last_activity_device = device_name or "dispositivo de entrada"
+        self.activity_generation += 1
 
     def on_input_status(self, status):
         self.input_monitor_status = status or {}; self.refresh_activity_label()
@@ -911,6 +1028,78 @@ class MainWindow(QMainWindow):
         self.notify("Esperando inactividad", f"{reason} Próxima comprobación: {dt.strftime('%H:%M')}.", True)
         if self.config.get("overlay_all_schedule_warnings", True): self.show_warning_banner("AMP AutoPower — esperando inactividad", reason, 10000)
 
+    def _has_active_dialog_for_schedule(self, schedule_id):
+        for dlg in self.active_dialogs.values():
+            if getattr(getattr(dlg, "schedule", None), "id", None) == schedule_id:
+                return True
+        return False
+
+    def _idle_only_tick(self, s, now):
+        if now.weekday() not in s.weekdays:
+            return
+
+        if not self.input_monitor_reliable():
+            return
+
+        if self._has_active_dialog_for_schedule(s.id):
+            return
+
+        # Si había un aplazamiento y después hubo actividad real,
+        # cancelar el aplazamiento y comenzar un ciclo de inactividad nuevo.
+        snooze_iso = self.state.get("snoozes", {}).get(s.id)
+
+        if snooze_iso:
+            snooze_generation = self.idle_snooze_generation.get(s.id)
+
+            if (
+                snooze_generation is not None
+                and snooze_generation != self.activity_generation
+            ):
+                self.state.get("snoozes", {}).pop(s.id, None)
+                self.idle_snooze_generation.pop(s.id, None)
+                save_json(STATE_FILE, self.state)
+                snooze_iso = None
+
+        if snooze_iso:
+            try:
+                snooze_dt = datetime.fromisoformat(snooze_iso)
+
+                if snooze_dt > now:
+                    return
+
+                self.state.get("snoozes", {}).pop(s.id, None)
+                self.idle_snooze_generation.pop(s.id, None)
+                save_json(STATE_FILE, self.state)
+
+            except Exception:
+                self.state.get("snoozes", {}).pop(s.id, None)
+                self.idle_snooze_generation.pop(s.id, None)
+                save_json(STATE_FILE, self.state)
+
+        threshold = max(60, int(s.idle_minutes) * 60)
+
+        if self.idle_seconds() < threshold:
+            return
+
+        # Ya se mostró/ejecutó durante este mismo ciclo de inactividad.
+        if (
+            self.idle_triggered_generation.get(s.id)
+            == self.activity_generation
+        ):
+            return
+
+        self.idle_triggered_generation[s.id] = self.activity_generation
+
+        target = now
+        key = f"idle:{s.id}:{self.activity_generation}"
+
+        self.start_final_countdown(
+            s,
+            target,
+            int(s.final_countdown_seconds),
+            key,
+        )
+
     # ---------------- Overlays de aviso ----------------
     def show_warning_banner(self, title, body, lifetime_ms=12000):
         if not self.config.get("fullscreen_overlay", True): return
@@ -926,13 +1115,30 @@ class MainWindow(QMainWindow):
 
     def refresh_list(self):
         self.list.clear()
+
         for s in self.schedules():
-            days = "Todos" if len(s.weekdays) == 7 else ", ".join(WEEKDAYS[i] for i in s.weekdays)
+            days = (
+                "Todos"
+                if len(s.weekdays) == 7
+                else ", ".join(WEEKDAYS[i] for i in s.weekdays)
+            )
+
             status = "✓" if s.enabled else "✗"
-            text = f"{status}  {s.time} — {s.name} — {ACTIONS.get(s.action, s.action)} — {days}"
+
+            if getattr(s, "use_time", True):
+                trigger = s.time
+            else:
+                trigger = f"Inactividad {s.idle_minutes} min"
+
+            text = (
+                f"{status}  {trigger} — {s.name} — "
+                f"{ACTIONS.get(s.action, s.action)} — {days}"
+            )
+
             item = QListWidgetItem(text)
             item.setData(Qt.UserRole, s.id)
             self.list.addItem(item)
+
         self.update_next_label()
 
     def get_selected_id(self):
@@ -968,6 +1174,9 @@ class MainWindow(QMainWindow):
             self.set_schedules([s for s in self.schedules() if s.id != sid])
 
     def next_occurrence(self, s: Schedule, now=None):
+        if not getattr(s, "use_time", True):
+            return None
+
         now = now or datetime.now()
         hh, mm = map(int, s.time.split(":"))
         snooze_iso = self.state.get("snoozes", {}).get(s.id)
@@ -994,24 +1203,59 @@ class MainWindow(QMainWindow):
     def update_next_label(self):
         now = datetime.now()
         candidates = []
+        idle_modes = []
+
         for s in self.schedules():
             if not s.enabled:
                 continue
+
+            if not getattr(s, "use_time", True):
+                if now.weekday() in s.weekdays:
+                    idle_modes.append(s)
+                continue
+
             nxt = self.next_occurrence(s, now)
+
             if nxt:
                 candidates.append((nxt, s))
-        if not candidates:
-            self.status_label.setText("No hay ninguna acción activa programada.")
+
+        parts = []
+
+        if candidates:
+            nxt, s = min(candidates, key=lambda x: x[0])
+            delta = nxt - now
+            sec = max(0, int(delta.total_seconds()))
+            h, rem = divmod(sec, 3600)
+            m, _ = divmod(rem, 60)
+
+            parts.append(
+                f"Próxima acción con hora: "
+                f"<b>{ACTIONS.get(s.action, s.action)}</b> — "
+                f"<b>{nxt.strftime('%a %d/%m %H:%M')}</b> — "
+                f"faltan {h} h {m} min"
+            )
+
+        if idle_modes:
+            details = "; ".join(
+                f"{ACTIONS.get(s.action, s.action)} tras "
+                f"{s.idle_minutes} min"
+                for s in idle_modes[:3]
+            )
+
+            if len(idle_modes) > 3:
+                details += f"; +{len(idle_modes) - 3} más"
+
+            parts.append(
+                f"Modo por inactividad activo: <b>{details}</b>"
+            )
+
+        if not parts:
+            self.status_label.setText(
+                "No hay ninguna acción activa programada."
+            )
             return
-        nxt, s = min(candidates, key=lambda x: x[0])
-        delta = nxt - now
-        sec = max(0, int(delta.total_seconds()))
-        h, rem = divmod(sec, 3600)
-        m, _ = divmod(rem, 60)
-        self.status_label.setText(
-            f"Próxima acción: <b>{ACTIONS.get(s.action, s.action)}</b> — "
-            f"<b>{nxt.strftime('%a %d/%m %H:%M')}</b> — faltan {h} h {m} min"
-        )
+
+        self.status_label.setText("<br>".join(parts))
 
     def notify(self, title, body, critical=False):
         log(f"Aviso: {title} | {body}")
@@ -1035,33 +1279,89 @@ class MainWindow(QMainWindow):
     def scheduler_tick(self):
         now = datetime.now()
         dayprefix = now.strftime("%Y-%m-%d")
-        self.warned = {x for x in self.warned if dayprefix in x}
+
+        self.warned = {
+            x for x in self.warned
+            if dayprefix in x
+        }
 
         for s in self.schedules():
             if not s.enabled or not s.weekdays:
                 continue
-            target = self.next_occurrence(s, now - timedelta(seconds=2))
+
+            # Modo nuevo: sin hora fija, basado únicamente en inactividad.
+            if not getattr(s, "use_time", True):
+                self._idle_only_tick(s, now)
+                continue
+
+            target = self.next_occurrence(
+                s,
+                now - timedelta(seconds=2),
+            )
+
             if not target:
                 continue
+
             remaining = (target - now).total_seconds()
+
             for mins in s.warning_minutes:
-                if 0 < remaining <= mins * 60 and remaining > mins * 60 - 2.5:
+                if (
+                    0 < remaining <= mins * 60
+                    and remaining > mins * 60 - 2.5
+                ):
                     key = f"{target.date()}:{s.id}:warn:{mins}"
+
                     if key not in self.warned:
                         self.warned.add(key)
-                        warning_title = f"{ACTIONS.get(s.action, s.action)} programado"
-                        warning_body = f"La PC ejecutará «{ACTIONS.get(s.action, s.action)}» en {mins} minuto(s), a las {target.strftime('%H:%M')}. Abre {APP_NAME} para cancelar o cambiarlo."
-                        self.notify(warning_title, warning_body, critical=mins <= 5)
-                        if self.config.get("overlay_all_schedule_warnings", True):
-                            self.show_warning_banner(warning_title, warning_body, 12000 if mins <= 5 else 9000)
+
+                        warning_title = (
+                            f"{ACTIONS.get(s.action, s.action)} programado"
+                        )
+
+                        warning_body = (
+                            f"La PC ejecutará "
+                            f"«{ACTIONS.get(s.action, s.action)}» "
+                            f"en {mins} minuto(s), a las "
+                            f"{target.strftime('%H:%M')}. "
+                            f"Abre {APP_NAME} para cancelar o cambiarlo."
+                        )
+
+                        self.notify(
+                            warning_title,
+                            warning_body,
+                            critical=mins <= 5,
+                        )
+
+                        if self.config.get(
+                            "overlay_all_schedule_warnings",
+                            True,
+                        ):
+                            self.show_warning_banner(
+                                warning_title,
+                                warning_body,
+                                12000 if mins <= 5 else 9000,
+                            )
+
             if 0 < remaining <= s.final_countdown_seconds:
                 key = f"{target.isoformat()}:{s.id}"
+
                 if key not in self.active_dialogs:
                     if getattr(s, "require_idle", False):
-                        if (not self.input_monitor_reliable()) or self.idle_seconds() < int(s.idle_minutes)*60:
+                        if (
+                            not self.input_monitor_reliable()
+                            or self.idle_seconds()
+                            < int(s.idle_minutes) * 60
+                        ):
                             self.defer_for_idle(s, target)
                             continue
-                    self.start_final_countdown(s, target, int(max(1, remaining)), key)
+
+                    self.start_final_countdown(
+                        s,
+                        target,
+                        int(max(1, remaining)),
+                        key,
+                    )
+
         self.update_next_label()
 
     def start_final_countdown(self, s, target, seconds, key):
@@ -1097,31 +1397,309 @@ class MainWindow(QMainWindow):
 
     def snooze(self, s, minutes):
         dt = datetime.now() + timedelta(minutes=minutes)
+
         self.state.setdefault("snoozes", {})[s.id] = dt.isoformat()
+
+        if not getattr(s, "use_time", True):
+            # Permitir que se vuelva a mostrar al terminar el aplazamiento,
+            # siempre que el usuario no haya vuelto a usar la PC.
+            self.idle_triggered_generation.pop(s.id, None)
+            self.idle_snooze_generation[s.id] = self.activity_generation
+
         save_json(STATE_FILE, self.state)
-        self.notify("Acción pospuesta", f"«{s.name}» se ejecutará a las {dt.strftime('%H:%M')}, en {minutes} minutos.")
+
+        self.notify(
+            "Acción pospuesta",
+            f"«{s.name}» se ejecutará a las {dt.strftime('%H:%M')}, "
+            f"en {minutes} minutos.",
+        )
+
+    def _chrome_main_processes(self):
+        """Devuelve solamente procesos principales de Google Chrome."""
+        found = []
+        nul = bytes((0,))
+
+        try:
+            entries = list(Path("/proc").iterdir())
+        except OSError:
+            return found
+
+        for proc in entries:
+            if not proc.name.isdigit():
+                continue
+
+            try:
+                exe = os.path.realpath(proc / "exe")
+
+                if exe != "/opt/google/chrome/chrome":
+                    continue
+
+                raw = (proc / "cmdline").read_bytes()
+
+                if not raw:
+                    continue
+
+                fields = [
+                    field
+                    for field in raw.split(nul)
+                    if field
+                ]
+
+                if not fields:
+                    continue
+
+                # Todo proceso secundario de Chromium contiene
+                # --type= en su cmdline: renderer, zygote,
+                # gpu-process, utility, etc.
+                #
+                # Comprobamos el cmdline bruto porque en algunas
+                # ejecuciones no podemos depender de cómo queden
+                # separados los argumentos en /proc/PID/cmdline.
+                if b"--type=" in raw:
+                    continue
+
+                args = [
+                    field.decode("utf-8", "replace")
+                    for field in fields
+                ]
+
+                found.append((int(proc.name), args))
+
+            except (
+                OSError,
+                PermissionError,
+                ValueError,
+            ):
+                continue
+
+        return found
+
+    def _close_chrome_cleanly(self):
+        """
+        Pide a Chrome una salida normal mediante SIGHUP.
+
+        Esto reproduce el comportamiento que comprobamos manualmente:
+        Chrome guarda correctamente sus ventanas/pestañas antes de salir.
+
+        Nunca se usa SIGKILL.
+        """
+        processes = self._chrome_main_processes()
+
+        if not processes:
+            return True
+
+        pids = [pid for pid, _args in processes]
+
+        self.notify(
+            "Cerrando Chrome",
+            (
+                f"Solicitando a {len(pids)} proceso(s) principal(es) de "
+                "Chrome que guarden sus ventanas y salgan correctamente."
+            ),
+        )
+
+        failed = []
+
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGHUP)
+
+            except ProcessLookupError:
+                # Ya había terminado.
+                continue
+
+            except (PermissionError, OSError) as exc:
+                failed.append((pid, str(exc)))
+
+        if failed:
+            details = ", ".join(
+                f"PID {pid}: {error}"
+                for pid, error in failed
+            )
+
+            self.notify(
+                "No se ejecutó la acción",
+                (
+                    "No se pudo solicitar un cierre correcto de Chrome. "
+                    "Por seguridad no se apagó ni reinició la PC.\n\n"
+                    f"{details}"
+                ),
+                True,
+            )
+            return False
+
+        # Chrome normalmente tarda muy poco, pero le damos hasta 15 s
+        # para escribir su estado de sesión y terminar.
+        deadline = time.monotonic() + 15.0
+        remaining = set(pids)
+
+        while remaining and time.monotonic() < deadline:
+            still_running = set()
+
+            for pid in remaining:
+                try:
+                    proc_dir = Path(f"/proc/{pid}")
+
+                    if not proc_dir.exists():
+                        continue
+
+                    exe = os.path.realpath(proc_dir / "exe")
+
+                    if (
+                        exe == "/opt/google/chrome/chrome"
+                        or Path(exe).name == "chrome"
+                    ):
+                        still_running.add(pid)
+
+                except OSError:
+                    continue
+
+            remaining = still_running
+
+            if remaining:
+                time.sleep(0.20)
+
+        if remaining:
+            pid_text = ", ".join(
+                str(pid)
+                for pid in sorted(remaining)
+            )
+
+            self.notify(
+                "No se ejecutó la acción",
+                (
+                    "Chrome no terminó correctamente después de 15 "
+                    "segundos. No se forzó su cierre y tampoco se "
+                    "apagó/reinició la PC para evitar perder el estado "
+                    f"de las ventanas. PID pendientes: {pid_text}"
+                ),
+                True,
+            )
+            return False
+
+        # Pequeño margen para que los últimos datos escritos lleguen
+        # completamente al almacenamiento.
+        time.sleep(0.5)
+
+        self.notify(
+            "Chrome cerrado correctamente",
+            (
+                "Chrome guardó su estado y terminó. "
+                "Ahora Plasma puede cerrar el resto de la sesión."
+            ),
+        )
+
+        return True
 
     def execute_action(self, s, target):
         self.state.setdefault("last_runs", {})[s.id] = target.isoformat()
         self.state.get("snoozes", {}).pop(s.id, None)
         save_json(STATE_FILE, self.state)
+
         if s.action == "test":
-            self.notify("Prueba completada", "El aviso y la cuenta regresiva funcionan correctamente.")
+            self.notify(
+                "Prueba completada",
+                "El aviso y la cuenta regresiva funcionan correctamente.",
+            )
             return
+
+        if (
+            getattr(s, "close_apps_first", True)
+            and s.action in ("poweroff", "reboot")
+        ):
+            # Chrome necesita una petición de salida propia antes del
+            # cierre global de Plasma. SIGHUP fue probado manualmente
+            # y conserva correctamente todas sus ventanas/pestañas.
+            if not self._close_chrome_cleanly():
+                return
+
+            qdbus = None
+
+            for candidate in (
+                "qdbus6",
+                "qdbus",
+                "qdbus-qt6",
+                "qdbus-qt5",
+            ):
+                path = shutil.which(candidate)
+                if path:
+                    qdbus = path
+                    break
+
+            if not qdbus:
+                self.notify(
+                    "No se ejecutó la acción",
+                    "La programación pidió cerrar las aplicaciones "
+                    "correctamente, pero no se encontró qdbus6/qdbus. "
+                    "Por seguridad no se forzó el apagado.",
+                    True,
+                )
+                return
+
+            method = (
+                "org.kde.Shutdown.logoutAndShutdown"
+                if s.action == "poweroff"
+                else "org.kde.Shutdown.logoutAndReboot"
+            )
+
+            self.notify(
+                "Cerrando aplicaciones",
+                "Plasma cerrará la sesión y permitirá que las "
+                "aplicaciones guarden correctamente su estado antes de "
+                f"{ACTIONS.get(s.action, s.action).lower()}.",
+                True,
+            )
+
+            result = run_cmd([
+                qdbus,
+                "org.kde.Shutdown",
+                "/Shutdown",
+                method,
+            ])
+
+            if result.returncode != 0:
+                self.notify(
+                    "No se pudo iniciar el cierre seguro",
+                    result.stderr.strip()
+                    or result.stdout.strip()
+                    or "qdbus devolvió un error desconocido.",
+                    True,
+                )
+
+            # logoutAndShutdown/logoutAndReboot ya realizan la acción.
+            return
+
         command_map = {
             "poweroff": ["systemctl", "poweroff"],
             "reboot": ["systemctl", "reboot"],
             "suspend": ["systemctl", "suspend"],
             "hibernate": ["systemctl", "hibernate"],
         }
+
         cmd = command_map.get(s.action)
+
         if not cmd:
-            self.notify("Error", f"Acción desconocida: {s.action}", True)
+            self.notify(
+                "Error",
+                f"Acción desconocida: {s.action}",
+                True,
+            )
             return
-        self.notify("Ejecutando", ACTIONS.get(s.action, s.action), True)
+
+        self.notify(
+            "Ejecutando",
+            ACTIONS.get(s.action, s.action),
+            True,
+        )
+
         result = run_cmd(cmd)
+
         if result.returncode != 0:
-            self.notify("No se pudo ejecutar la acción", result.stderr.strip() or "Error desconocido", True)
+            self.notify(
+                "No se pudo ejecutar la acción",
+                result.stderr.strip() or "Error desconocido",
+                True,
+            )
 
     def cancel_next_run(self):
         now = datetime.now()
@@ -1271,73 +1849,235 @@ class MainWindow(QMainWindow):
 
     def prepare_install_package(self, path: Path):
         if self.active_dialogs:
-            QMessageBox.warning(self, "Actualización", "Hay una cuenta regresiva de energía activa. Cancélala o espera a que termine antes de actualizar.")
+            QMessageBox.warning(
+                self,
+                "Actualización",
+                "Hay una cuenta regresiva de energía activa. "
+                "Cancélala o espera a que termine antes de actualizar.",
+            )
             return
+
+        if self.install_process and self.install_process.poll() is None:
+            QMessageBox.information(
+                self,
+                "Actualización",
+                "Ya hay una instalación en curso.",
+            )
+            return
+
         if not path.exists():
-            QMessageBox.warning(self, "Actualización", "El paquete seleccionado ya no existe.")
+            QMessageBox.warning(
+                self,
+                "Actualización",
+                "El paquete seleccionado ya no existe.",
+            )
             return
+
         ver = package_version(path)
+
         if not ver:
-            QMessageBox.critical(self, "Actualización", "El paquete no contiene un archivo VERSION válido.")
+            QMessageBox.critical(
+                self,
+                "Actualización",
+                "El paquete no contiene un archivo VERSION válido.",
+            )
             return
+
         if version_tuple(ver) <= version_tuple(APP_VERSION):
             ans = QMessageBox.question(
                 self,
                 "Versión no más reciente",
-                f"El paquete es v{ver} y tienes v{APP_VERSION}. ¿Quieres reinstalarlo de todos modos?",
+                f"El paquete es v{ver} y tienes v{APP_VERSION}. "
+                "¿Quieres reinstalarlo de todos modos?",
             )
+
             if ans != QMessageBox.Yes:
                 return
+
         else:
             ans = QMessageBox.question(
                 self,
                 "Instalar actualización",
                 f"Se instalará AMP AutoPower v{ver}.\n\n"
-                "Tus horarios y ajustes se conservarán. Se creará una copia de seguridad de la versión actual y el servicio se reiniciará.\n\n"
+                "Tus horarios y ajustes se conservarán. "
+                "Se creará una copia de seguridad de la versión actual.\n\n"
+                "Cuando la instalación termine podrás pulsar OK y "
+                "solo entonces AMP AutoPower se reiniciará.\n\n"
                 "¿Continuar?",
             )
+
             if ans != QMessageBox.Yes:
                 return
 
         try:
-            stage = Path(tempfile.mkdtemp(prefix="amp-autopower-update-", dir=str(UPDATE_CACHE_DIR)))
+            stage = Path(
+                tempfile.mkdtemp(
+                    prefix="amp-autopower-update-",
+                    dir=str(UPDATE_CACHE_DIR),
+                )
+            )
+
             with tarfile.open(path, "r:*") as tf:
                 safe_extract_tar(tf, stage)
+
             installers = []
+
             for installer in stage.rglob("install.sh"):
                 parent = installer.parent
-                if (parent / "amp_autopower.py").exists() and (parent / "VERSION").exists():
+
+                if (
+                    (parent / "amp_autopower.py").exists()
+                    and (parent / "VERSION").exists()
+                ):
                     installers.append(installer)
+
             if not installers:
-                raise ValueError("No se encontró install.sh junto al programa dentro del paquete.")
-            installer = min(installers, key=lambda p: len(p.parts))
+                raise ValueError(
+                    "No se encontró install.sh junto al programa "
+                    "dentro del paquete."
+                )
+
+            installer = min(
+                installers,
+                key=lambda p: len(p.parts),
+            )
+
             ensure_dirs()
-            unit_name = f"amp-autopower-update-{int(time.time())}-{uuid.uuid4().hex[:8]}"
-            log(f"Iniciando actualización desde {path} a v{ver} mediante {unit_name}")
-            subprocess.Popen(
+
+            unit_name = (
+                f"amp-autopower-update-install-"
+                f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+            )
+
+            log(
+                f"Instalando actualización desde {path} "
+                f"a v{ver} mediante {unit_name}; "
+                "el reinicio esperará confirmación del usuario"
+            )
+
+            self.pending_update_version = ver
+
+            self.install_progress = QProgressDialog(
+                f"Instalando AMP AutoPower v{ver}…",
+                "",
+                0,
+                0,
+                self,
+            )
+
+            self.install_progress.setWindowTitle("AMP AutoPower")
+            self.install_progress.setCancelButton(None)
+            self.install_progress.setMinimumDuration(0)
+            self.install_progress.setWindowModality(Qt.WindowModal)
+            self.install_progress.show()
+
+            self.install_process = subprocess.Popen(
                 [
                     "systemd-run",
                     "--user",
                     "--quiet",
+                    "--wait",
                     "--collect",
                     f"--unit={unit_name}",
                     "/usr/bin/bash",
                     str(installer),
-                    "--update",
+                    "--update-no-restart",
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
-            QMessageBox.information(
-                self,
-                "Actualización iniciada",
-                f"Se está instalando AMP AutoPower v{ver}.\n\n"
-                "La aplicación se reiniciará automáticamente. Si tarda, puedes abrirla de nuevo desde el menú de KDE."
-            )
+
+            self.install_poll_timer.start(250)
+
         except Exception as e:
             log(f"Error preparando actualización: {e}")
-            QMessageBox.critical(self, "Actualización", f"No se pudo preparar la actualización:\n\n{e}")
+
+            if self.install_progress:
+                self.install_progress.close()
+                self.install_progress = None
+
+            QMessageBox.critical(
+                self,
+                "Actualización",
+                f"No se pudo preparar la actualización:\n\n{e}",
+            )
+
+    def _poll_update_install(self):
+        if not self.install_process:
+            self.install_poll_timer.stop()
+            return
+
+        rc = self.install_process.poll()
+
+        if rc is None:
+            return
+
+        self.install_poll_timer.stop()
+
+        if self.install_progress:
+            self.install_progress.close()
+            self.install_progress = None
+
+        ver = self.pending_update_version or "desconocida"
+
+        self.install_process = None
+        self.pending_update_version = None
+
+        if rc != 0:
+            QMessageBox.critical(
+                self,
+                "Actualización",
+                f"No se pudo instalar AMP AutoPower v{ver}.\n\n"
+                f"Revisa el registro:\n{LOG_DIR / 'update.log'}",
+            )
+            return
+
+        log(
+            f"AMP AutoPower v{ver} instalada correctamente; "
+            "esperando OK antes de reiniciar"
+        )
+
+        QMessageBox.information(
+            self,
+            "Actualización instalada",
+            f"AMP AutoPower v{ver} se instaló correctamente.\n\n"
+            "Pulsa OK para reiniciar AMP AutoPower y usar la nueva versión.",
+        )
+
+        # Esta línea solo se alcanza DESPUÉS de pulsar OK.
+        self._restart_after_update()
+
+    def _restart_after_update(self):
+        unit_name = (
+            f"amp-autopower-update-restart-"
+            f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+        )
+
+        self.update_status.setText(
+            "Actualización instalada. Reiniciando AMP AutoPower…"
+        )
+
+        log(
+            "El usuario confirmó OK; reiniciando AMP AutoPower"
+        )
+
+        subprocess.Popen(
+            [
+                "systemd-run",
+                "--user",
+                "--quiet",
+                "--collect",
+                f"--unit={unit_name}",
+                "/usr/bin/systemctl",
+                "--user",
+                "restart",
+                "amp-autopower.service",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
 
     def on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.Trigger:

@@ -5,6 +5,12 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
+
+# En el arranque, systemd --user puede llegar aquí antes de que
+# KWin haya creado el socket de Wayland. Esperamos hasta 60 s
+# para evitar que Qt aborte y genere un core dump.
+ExecStartPre=/usr/bin/bash -c 'for ((i=0; i<60; i++)); do for s in "%t"/wayland-*; do [ -S "$s" ] && exit 0; done; /usr/bin/sleep 1; done; exit 1'
+
 ExecStart=%h/.local/bin/amp-autopower
 Restart=on-failure
 RestartSec=5

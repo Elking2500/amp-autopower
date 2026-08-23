@@ -3,7 +3,15 @@ set -Eeuo pipefail
 
 APP_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODE="install"
-[[ "${1:-}" == "--update" ]] && MODE="update"
+
+case "${1:-}" in
+  --update)
+    MODE="update"
+    ;;
+  --update-no-restart)
+    MODE="update-no-restart"
+    ;;
+esac
 
 VERSION="$(tr -d '[:space:]' < "$APP_SRC/VERSION")"
 APP_SHARE="$HOME/.local/share/amp-autopower"
@@ -99,9 +107,13 @@ EOF
 fi
 
 if [[ "$MODE" == "update" ]]; then
-  # El instalador ya corre en su propia unidad systemd transitoria,
-  # fuera del cgroup de AMP AutoPower.
+  # Compatibilidad con actualizadores anteriores.
   systemctl --user restart amp-autopower.service
+
+elif [[ "$MODE" == "update-no-restart" ]]; then
+  echo "Instalación terminada correctamente."
+  echo "El reinicio queda pendiente hasta que el usuario pulse OK."
+
 else
   systemctl --user restart amp-autopower.service 2>/dev/null || systemctl --user start amp-autopower.service
 fi
