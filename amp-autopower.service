@@ -1,0 +1,14 @@
+[Unit]
+Description=AMP AutoPower para KDE/CachyOS
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/amp-autopower
+Restart=on-failure
+RestartSec=5
+Environment=QT_QPA_PLATFORM=wayland
+
+[Install]
+WantedBy=default.target

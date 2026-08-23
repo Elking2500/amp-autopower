@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=AMP AutoPower
+Comment=Programa y avisa antes de apagar, reiniciar, suspender o hibernar
+Exec=@APP_EXEC@ --show
+Icon=system-shutdown
+Terminal=false
+Categories=Utility;System;
+StartupNotify=true
