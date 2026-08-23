@@ -23,7 +23,12 @@ echo "[$(date '+%F %T')] Instalando AMP AutoPower v$VERSION (modo: $MODE)"
 
 if ! python3 -c 'import PySide6' >/dev/null 2>&1; then
   echo "Falta PySide6. En CachyOS/Arch instala primero:"
-  echo "  sudo pacman -S --needed pyside6 libnotify"
+  echo "  sudo pacman -S --needed pyside6 python-evdev libnotify"
+  exit 2
+fi
+
+if ! python3 -c 'import evdev' >/dev/null 2>&1; then
+  echo "Falta python-evdev. Instala: sudo pacman -S --needed python-evdev"
   exit 2
 fi
 

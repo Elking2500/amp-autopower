@@ -3,6 +3,8 @@ import hashlib
 import json
 import os
 import re
+import select
+import time
 import shutil
 import subprocess
 import sys
@@ -27,9 +29,16 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import QTime
 
+try:
+    import evdev
+    from evdev import ecodes
+except Exception:
+    evdev = None
+    ecodes = None
+
 APP_NAME = "AMP AutoPower"
 APP_ID = "amp-autopower"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.1"
 IPC_NAME = "amp-autopower-ipc-v1"
 CONFIG_DIR = Path.home() / ".config" / APP_ID
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -143,6 +152,8 @@ class Schedule:
     action: str = "poweroff"
     warning_minutes: list = field(default_factory=lambda: [30, 15, 5, 1])
     final_countdown_seconds: int = 60
+    require_idle: bool = False
+    idle_minutes: int = 30
 
 
 DEFAULT_CONFIG = {
@@ -150,6 +161,10 @@ DEFAULT_CONFIG = {
     "close_to_tray": True,
     "notifications": True,
     "sound": True,
+    "input_monitor_enabled": True,
+    "fullscreen_overlay": True,
+    "overlay_all_screens": True,
+    "overlay_all_schedule_warnings": True,
     "auto_check_updates": True,
     "update_interval_hours": 48,
     "update_manifest_url": CANONICAL_UPDATE_MANIFEST_URL,
@@ -286,69 +301,223 @@ class DownloadThread(QThread):
             self.finished_download.emit({"ok": False, "error": str(e)})
 
 
+class InputActivityMonitor(QThread):
+    activity = Signal(str)
+    status = Signal(object)
+
+    EXCLUDED_NAME_PARTS = (
+        "power button", "sleep button", "lid switch", "video bus",
+        "pc speaker", "hda", "hd-audio", "acpi", "gpio keys",
+        "motion sensor", "motion sensors", "accelerometer", "gyroscope", "gyro",
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._devices = {}
+        self._axis_state = {}
+        self._last_status = None
+
+    def _looks_like_user_input(self, dev):
+        name = (dev.name or "").lower()
+        if any(x in name for x in self.EXCLUDED_NAME_PARTS):
+            return False
+        try:
+            caps = dev.capabilities(absinfo=False)
+        except Exception:
+            return False
+        return any(t in caps for t in (ecodes.EV_KEY, ecodes.EV_REL, ecodes.EV_ABS))
+
+    def _report_status(self, denied=0, total=0):
+        names = sorted({(d.name or Path(d.path).name) for d in self._devices.values()})
+        data = {
+            "backend": "evdev", "available": evdev is not None,
+            "accessible": len(self._devices), "denied": denied,
+            "total": total, "devices": names,
+        }
+        if data != self._last_status:
+            self._last_status = data
+            self.status.emit(data)
+
+    def _rescan(self):
+        if evdev is None:
+            self._report_status()
+            return
+        try:
+            paths = set(evdev.list_devices())
+        except Exception:
+            paths = set()
+        for path in list(self._devices):
+            if path not in paths:
+                try: self._devices[path].close()
+                except Exception: pass
+                self._devices.pop(path, None)
+        denied = 0
+        for path in sorted(paths):
+            if path in self._devices:
+                continue
+            try:
+                dev = evdev.InputDevice(path)
+                if not self._looks_like_user_input(dev):
+                    dev.close(); continue
+                os.set_blocking(dev.fd, False)
+                self._devices[path] = dev
+            except PermissionError:
+                denied += 1
+            except Exception:
+                continue
+        self._report_status(denied=denied, total=len(paths))
+
+    def _abs_event_is_activity(self, dev, event):
+        key = (dev.path, event.code)
+        previous = self._axis_state.get(key)
+        self._axis_state[key] = event.value
+        if previous is None:
+            return False
+        try:
+            info = dev.absinfo(event.code)
+            span = max(1, int(info.max) - int(info.min))
+            threshold = max(2, int(span * 0.025))
+        except Exception:
+            threshold = 4
+        return abs(int(event.value) - int(previous)) >= threshold
+
+    def _is_activity(self, dev, event):
+        if event.type == ecodes.EV_KEY:
+            return event.value == 1
+        if event.type == ecodes.EV_REL:
+            return event.value != 0
+        if event.type == ecodes.EV_ABS:
+            return self._abs_event_is_activity(dev, event)
+        return False
+
+    def run(self):
+        if evdev is None:
+            self._report_status(); return
+        last_scan = 0.0
+        while not self.isInterruptionRequested():
+            now = time.monotonic()
+            if now - last_scan >= 4.0:
+                self._rescan(); last_scan = now
+            devices = list(self._devices.values())
+            if not devices:
+                self.msleep(500); continue
+            try:
+                readable, _, _ = select.select(devices, [], [], 0.75)
+            except (OSError, ValueError):
+                self._rescan(); self.msleep(200); continue
+            for dev in readable:
+                try:
+                    for event in dev.read():
+                        if self._is_activity(dev, event):
+                            self.activity.emit(dev.name or Path(dev.path).name)
+                except BlockingIOError:
+                    pass
+                except OSError:
+                    try: dev.close()
+                    except Exception: pass
+                    self._devices.pop(dev.path, None)
+        for dev in list(self._devices.values()):
+            try: dev.close()
+            except Exception: pass
+        self._devices.clear()
+
+
+def _overlay_flags():
+    flags = Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+    if QApplication.platformName().lower() == "xcb":
+        flags |= Qt.X11BypassWindowManagerHint
+    return flags
+
+
+class WarningBanner(QWidget):
+    closed = Signal(object)
+    def __init__(self, screen, title, body, lifetime_ms=12000):
+        super().__init__(None, _overlay_flags())
+        self.screen = screen
+        self.setWindowTitle("AMP AutoPower — aviso")
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        root = QVBoxLayout(self); root.setContentsMargins(18,18,18,18)
+        card = QWidget()
+        card.setStyleSheet("QWidget{background:rgba(20,20,20,235);border:2px solid white;border-radius:14px;color:white;} QLabel{border:none;background:transparent;color:white;}")
+        lay = QVBoxLayout(card)
+        t = QLabel(title); t.setAlignment(Qt.AlignCenter); t.setStyleSheet("font-size:23px;font-weight:800;")
+        b = QLabel(body); b.setWordWrap(True); b.setAlignment(Qt.AlignCenter); b.setStyleSheet("font-size:16px;")
+        lay.addWidget(t); lay.addWidget(b); root.addWidget(card)
+        geo = screen.availableGeometry(); width = min(850, max(520, int(geo.width()*0.55)))
+        self.resize(width,150); self.move(geo.x()+(geo.width()-width)//2, geo.y()+max(18,int(geo.height()*0.035)))
+        self.keep_above = QTimer(self); self.keep_above.timeout.connect(self.raise_); self.keep_above.start(350)
+        QTimer.singleShot(lifetime_ms, self.close)
+    def closeEvent(self, event):
+        self.keep_above.stop(); self.closed.emit(self); super().closeEvent(event)
+
+
+class OverlayPage(QWidget):
+    action_requested = Signal(str)
+    def __init__(self, screen, schedule, remaining):
+        super().__init__(None, _overlay_flags())
+        self.screen = screen; self.schedule = schedule
+        self.setWindowTitle("AMP AutoPower — EMERGENCIA")
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setStyleSheet("background:rgba(0,0,0,190);color:white;")
+        outer = QVBoxLayout(self); outer.setContentsMargins(40,40,40,40); outer.addStretch()
+        card = QWidget(); card.setMaximumWidth(860)
+        card.setStyleSheet("QWidget{background:rgba(18,18,18,245);border:3px solid white;border-radius:18px;color:white;} QLabel{border:none;background:transparent;color:white;} QPushButton{font-size:17px;padding:14px 18px;border-radius:10px;border:1px solid #aaa;background:#333;color:white;} QPushButton:hover{background:#555;}")
+        lay = QVBoxLayout(card); lay.setContentsMargins(28,28,28,28)
+        self.title = QLabel(); self.title.setAlignment(Qt.AlignCenter); self.title.setStyleSheet("font-size:34px;font-weight:900;")
+        lay.addWidget(self.title)
+        desc = QLabel(f"Acción programada: <b>{ACTIONS.get(schedule.action, schedule.action)}</b><br>Horario original: <b>{schedule.time}</b><br><br>Este aviso está diseñado para mostrarse sobre aplicaciones y juegos a pantalla completa.")
+        desc.setAlignment(Qt.AlignCenter); desc.setWordWrap(True); desc.setStyleSheet("font-size:18px;"); lay.addWidget(desc)
+        row = QHBoxLayout()
+        for text, action in (("Cancelar esta vez","cancel"),("Posponer 10 min","snooze10"),("Posponer 30 min","snooze30")):
+            btn = QPushButton(text); btn.clicked.connect(lambda _=False, a=action: self.action_requested.emit(a)); row.addWidget(btn)
+        lay.addLayout(row)
+        center = QHBoxLayout(); center.addStretch(); center.addWidget(card); center.addStretch(); outer.addLayout(center); outer.addStretch()
+        self.update_remaining(remaining)
+    def update_remaining(self, remaining):
+        self.title.setText(f"{ACTIONS.get(self.schedule.action, self.schedule.action).upper()} EN {remaining} SEGUNDOS")
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.action_requested.emit("cancel"); return
+        super().keyPressEvent(event)
+
+
 class CountdownDialog(QDialog):
     def __init__(self, parent, schedule: Schedule, seconds: int):
         super().__init__(parent)
-        self.schedule = schedule
-        self.remaining = seconds
-        self.result_action = "execute"
-        self.setWindowTitle(f"{APP_NAME} — acción inminente")
-        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        self.setModal(False)
-        self.resize(520, 230)
-
-        lay = QVBoxLayout(self)
-        self.title = QLabel()
-        self.title.setAlignment(Qt.AlignCenter)
-        self.title.setStyleSheet("font-size: 22px; font-weight: 700;")
-        lay.addWidget(self.title)
-
-        desc = QLabel(
-            f"Acción programada: <b>{ACTIONS.get(schedule.action, schedule.action)}</b><br>"
-            f"Horario: <b>{schedule.time}</b><br><br>"
-            "Puedes cancelarla o posponerla antes de que termine la cuenta regresiva."
-        )
-        desc.setAlignment(Qt.AlignCenter)
-        desc.setWordWrap(True)
-        lay.addWidget(desc)
-
-        row = QHBoxLayout()
-        cancel = QPushButton("Cancelar esta vez")
-        snooze10 = QPushButton("Posponer 10 min")
-        snooze30 = QPushButton("Posponer 30 min")
-        cancel.clicked.connect(lambda: self.finish("cancel"))
-        snooze10.clicked.connect(lambda: self.finish("snooze10"))
-        snooze30.clicked.connect(lambda: self.finish("snooze30"))
-        row.addWidget(cancel)
-        row.addWidget(snooze10)
-        row.addWidget(snooze30)
-        lay.addLayout(row)
-
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.tick)
-        self.timer.start(1000)
-        self.update_text()
-
-    def update_text(self):
-        self.title.setText(f"{ACTIONS.get(self.schedule.action, self.schedule.action)} en {self.remaining} s")
-
+        self.schedule = schedule; self.remaining = seconds; self.result_action = "execute"; self.pages = []
+        self.setWindowTitle(f"{APP_NAME} — acción inminente"); self.setAttribute(Qt.WA_DontShowOnScreen, True)
+        self.timer = QTimer(self); self.timer.timeout.connect(self.tick); self.timer.start(1000)
+        self.keep_above = QTimer(self); self.keep_above.timeout.connect(self._raise_pages); self.keep_above.start(250)
+    def _make_pages(self):
+        if self.pages: return
+        parent = self.parent(); all_screens = bool(getattr(parent,"config",{}).get("overlay_all_screens",True))
+        screens = QApplication.screens() if all_screens else [QApplication.primaryScreen()]
+        for screen in screens:
+            if screen is None: continue
+            page = OverlayPage(screen,self.schedule,self.remaining); page.action_requested.connect(self.finish); page.setGeometry(screen.geometry()); self.pages.append(page)
+    def show(self):
+        self._make_pages()
+        for page in self.pages:
+            page.setGeometry(page.screen.geometry()); page.show(); page.showFullScreen(); page.raise_()
+        if self.pages: self.pages[0].activateWindow()
+        super().show()
+    def _raise_pages(self):
+        for page in self.pages:
+            if page.isVisible(): page.raise_()
     def tick(self):
         self.remaining -= 1
         if self.remaining <= 0:
-            self.timer.stop()
-            self.finish("execute")
-        else:
-            self.update_text()
-
+            self.timer.stop(); self.finish("execute"); return
+        for page in self.pages: page.update_remaining(self.remaining)
     def finish(self, action):
-        self.result_action = action
-        self.timer.stop()
-        self.done(QDialog.Accepted)
-
+        self.result_action = action; self.timer.stop(); self.keep_above.stop()
+        for page in self.pages: page.hide(); page.close()
+        self.pages.clear(); self.done(QDialog.Accepted)
     def closeEvent(self, event):
-        self.result_action = "cancel"
-        self.timer.stop()
-        event.accept()
+        if self.timer.isActive(): self.result_action = "cancel"; self.timer.stop()
+        self.keep_above.stop()
+        for page in self.pages: page.close()
+        self.pages.clear(); event.accept()
 
 
 class ScheduleEditor(QDialog):
@@ -375,12 +544,22 @@ class ScheduleEditor(QDialog):
         self.countdown.setRange(15, 600)
         self.countdown.setSuffix(" s")
         self.countdown.setValue(s.final_countdown_seconds)
+        self.require_idle = QCheckBox("Solo ejecutar cuando no haya actividad")
+        self.require_idle.setChecked(getattr(s, "require_idle", False))
+        self.idle_minutes = QSpinBox()
+        self.idle_minutes.setRange(1, 720)
+        self.idle_minutes.setSuffix(" min")
+        self.idle_minutes.setValue(max(1, int(getattr(s, "idle_minutes", 30))))
+        self.idle_minutes.setEnabled(self.require_idle.isChecked())
+        self.require_idle.toggled.connect(self.idle_minutes.setEnabled)
 
         form.addRow("Nombre:", self.name)
         form.addRow("Estado:", self.enabled)
         form.addRow("Hora:", self.time)
         form.addRow("Acción:", self.action)
         form.addRow("Cuenta regresiva final:", self.countdown)
+        form.addRow("Inactividad:", self.require_idle)
+        form.addRow("Tiempo mínimo inactivo:", self.idle_minutes)
         root.addLayout(form)
 
         days_box = QGroupBox("Días de la semana")
@@ -428,6 +607,8 @@ class ScheduleEditor(QDialog):
             action=self.action.currentData(),
             warning_minutes=sorted(warns, reverse=True),
             final_countdown_seconds=self.countdown.value(),
+            require_idle=self.require_idle.isChecked(),
+            idle_minutes=self.idle_minutes.value(),
         )
 
 
@@ -443,6 +624,11 @@ class MainWindow(QMainWindow):
         self.download_thread = None
         self.download_dialog = None
         self.available_update = self.state.get("available_update")
+        self.last_activity_monotonic = time.monotonic()
+        self.last_activity_device = "inicio de AMP AutoPower"
+        self.input_monitor_status = {"backend":"evdev","available":evdev is not None,"accessible":0,"denied":0,"total":0,"devices":[]}
+        self.input_monitor = None
+        self.banner_windows = []
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
         self.resize(800, 610)
         self.setMinimumSize(700, 500)
@@ -515,6 +701,29 @@ class MainWindow(QMainWindow):
         for w in (self.start_min, self.close_tray, self.notifications, self.sound):
             settings_layout.addWidget(w)
             w.toggled.connect(self.save_settings)
+
+        overlay_box = QGroupBox("Avisos sobre juegos y pantalla completa")
+        overlay_lay = QVBoxLayout(overlay_box)
+        self.fullscreen_overlay = QCheckBox("Forzar overlay de emergencia siempre encima")
+        self.fullscreen_overlay.setChecked(self.config.get("fullscreen_overlay", True))
+        self.overlay_all_screens = QCheckBox("Mostrar la cuenta regresiva en todas las pantallas")
+        self.overlay_all_screens.setChecked(self.config.get("overlay_all_screens", True))
+        self.overlay_all_schedule_warnings = QCheckBox("Mostrar también los avisos previos como bandas sobre el juego")
+        self.overlay_all_schedule_warnings.setChecked(self.config.get("overlay_all_schedule_warnings", True))
+        for w in (self.fullscreen_overlay, self.overlay_all_screens, self.overlay_all_schedule_warnings):
+            overlay_lay.addWidget(w); w.toggled.connect(self.save_settings)
+        settings_layout.addWidget(overlay_box)
+
+        activity_box = QGroupBox("Detección global de inactividad")
+        activity_lay = QVBoxLayout(activity_box)
+        self.input_monitor_check = QCheckBox("Detectar mouse, teclado, touchpad, joystick y mandos mediante evdev")
+        self.input_monitor_check.setChecked(self.config.get("input_monitor_enabled", True))
+        self.activity_label = QLabel("Inicializando monitor de entrada…")
+        self.activity_label.setWordWrap(True)
+        activity_lay.addWidget(self.input_monitor_check); activity_lay.addWidget(self.activity_label)
+        settings_layout.addWidget(activity_box)
+        self.input_monitor_check.toggled.connect(self.toggle_input_monitor)
+
         settings_layout.addStretch()
         tabs.addTab(settings_tab, "Ajustes")
 
@@ -582,6 +791,11 @@ class MainWindow(QMainWindow):
 
         self.refresh_list()
         self.refresh_update_ui()
+        self._start_input_monitor()
+        self.activity_ui_timer = QTimer(self)
+        self.activity_ui_timer.timeout.connect(self.refresh_activity_label)
+        self.activity_ui_timer.start(1000)
+        self.refresh_activity_label()
         self.scheduler = QTimer(self)
         self.scheduler.timeout.connect(self.scheduler_tick)
         self.scheduler.start(1000)
@@ -607,11 +821,81 @@ class MainWindow(QMainWindow):
         self.config["close_to_tray"] = self.close_tray.isChecked()
         self.config["notifications"] = self.notifications.isChecked()
         self.config["sound"] = self.sound.isChecked()
+        if hasattr(self, "input_monitor_check"):
+            self.config["input_monitor_enabled"] = self.input_monitor_check.isChecked()
+            self.config["fullscreen_overlay"] = self.fullscreen_overlay.isChecked()
+            self.config["overlay_all_screens"] = self.overlay_all_screens.isChecked()
+            self.config["overlay_all_schedule_warnings"] = self.overlay_all_schedule_warnings.isChecked()
         if hasattr(self, "auto_updates"):
             self.config["auto_check_updates"] = self.auto_updates.isChecked()
             self.config["notify_updates"] = self.notify_updates.isChecked()
             self.config["update_manifest_url"] = self.manifest_url.text().strip()
         save_json(CONFIG_FILE, self.config)
+
+    # ---------------- Actividad global ----------------
+    def _start_input_monitor(self):
+        if not self.config.get("input_monitor_enabled", True): return
+        if self.input_monitor and self.input_monitor.isRunning(): return
+        self.input_monitor = InputActivityMonitor(self)
+        self.input_monitor.activity.connect(self.on_input_activity)
+        self.input_monitor.status.connect(self.on_input_status)
+        self.input_monitor.start()
+
+    def toggle_input_monitor(self, checked):
+        self.config["input_monitor_enabled"] = bool(checked); save_json(CONFIG_FILE, self.config)
+        if checked:
+            self.last_activity_monotonic = time.monotonic(); self.last_activity_device = "monitor activado"; self._start_input_monitor()
+        elif self.input_monitor and self.input_monitor.isRunning():
+            self.input_monitor.requestInterruption()
+        self.refresh_activity_label()
+
+    def on_input_activity(self, device_name):
+        self.last_activity_monotonic = time.monotonic(); self.last_activity_device = device_name or "dispositivo de entrada"
+
+    def on_input_status(self, status):
+        self.input_monitor_status = status or {}; self.refresh_activity_label()
+
+    def idle_seconds(self):
+        return max(0.0, time.monotonic() - self.last_activity_monotonic)
+
+    def input_monitor_reliable(self):
+        return self.config.get("input_monitor_enabled", True) and bool(self.input_monitor_status.get("available")) and int(self.input_monitor_status.get("accessible",0)) > 0
+
+    def refresh_activity_label(self):
+        if not hasattr(self, "activity_label"): return
+        idle = int(self.idle_seconds()); mins, secs = divmod(idle, 60)
+        accessible = int(self.input_monitor_status.get("accessible",0)); denied = int(self.input_monitor_status.get("denied",0))
+        if evdev is None: status = "evdev no está instalado"
+        elif accessible <= 0: status = "sin acceso a dispositivos /dev/input"
+        else:
+            status = f"{accessible} dispositivo(s) monitorizado(s)"
+            if denied: status += f"; {denied} sin permiso"
+        self.activity_label.setText(f"<b>Estado:</b> {status}<br><b>Inactividad actual:</b> {mins} min {secs} s<br><b>Última actividad:</b> {self.last_activity_device}")
+
+    def defer_for_idle(self, s, target):
+        threshold = max(60, int(s.idle_minutes)*60); idle = int(self.idle_seconds())
+        if self.input_monitor_reliable():
+            missing = max(60, threshold-idle+2)
+            reason = f"Se detectó actividad. «{s.name}» requiere {s.idle_minutes} min sin usar mouse, teclado o mando."
+        else:
+            missing = 300
+            reason = f"«{s.name}» requiere inactividad, pero AMP AutoPower no puede leer dispositivos de entrada. Se reintentará en 5 minutos por seguridad."
+        dt = datetime.now()+timedelta(seconds=missing); self.state.setdefault("snoozes",{})[s.id] = dt.isoformat(); save_json(STATE_FILE,self.state)
+        self.notify("Esperando inactividad", f"{reason} Próxima comprobación: {dt.strftime('%H:%M')}.", True)
+        if self.config.get("overlay_all_schedule_warnings", True): self.show_warning_banner("AMP AutoPower — esperando inactividad", reason, 10000)
+
+    # ---------------- Overlays de aviso ----------------
+    def show_warning_banner(self, title, body, lifetime_ms=12000):
+        if not self.config.get("fullscreen_overlay", True): return
+        screens = QApplication.screens() if self.config.get("overlay_all_screens", True) else [QApplication.primaryScreen()]
+        for screen in screens:
+            if screen is None: continue
+            banner = WarningBanner(screen,title,body,lifetime_ms); self.banner_windows.append(banner); banner.closed.connect(self._remove_banner); banner.show(); banner.raise_()
+
+    def _remove_banner(self, banner):
+        try: self.banner_windows.remove(banner)
+        except ValueError: pass
+        banner.deleteLater()
 
     def refresh_list(self):
         self.list.clear()
@@ -738,14 +1022,18 @@ class MainWindow(QMainWindow):
                     key = f"{target.date()}:{s.id}:warn:{mins}"
                     if key not in self.warned:
                         self.warned.add(key)
-                        self.notify(
-                            f"{ACTIONS.get(s.action, s.action)} programado",
-                            f"La PC ejecutará «{ACTIONS.get(s.action, s.action)}» en {mins} minuto(s), a las {target.strftime('%H:%M')}. Abre {APP_NAME} para cancelar o cambiarlo.",
-                            critical=mins <= 5,
-                        )
+                        warning_title = f"{ACTIONS.get(s.action, s.action)} programado"
+                        warning_body = f"La PC ejecutará «{ACTIONS.get(s.action, s.action)}» en {mins} minuto(s), a las {target.strftime('%H:%M')}. Abre {APP_NAME} para cancelar o cambiarlo."
+                        self.notify(warning_title, warning_body, critical=mins <= 5)
+                        if self.config.get("overlay_all_schedule_warnings", True):
+                            self.show_warning_banner(warning_title, warning_body, 12000 if mins <= 5 else 9000)
             if 0 < remaining <= s.final_countdown_seconds:
                 key = f"{target.isoformat()}:{s.id}"
                 if key not in self.active_dialogs:
+                    if getattr(s, "require_idle", False):
+                        if (not self.input_monitor_reliable()) or self.idle_seconds() < int(s.idle_minutes)*60:
+                            self.defer_for_idle(s, target)
+                            continue
                     self.start_final_countdown(s, target, int(max(1, remaining)), key)
         self.update_next_label()
 
@@ -758,10 +1046,8 @@ class MainWindow(QMainWindow):
         dlg = CountdownDialog(self, s, seconds)
         self.active_dialogs[key] = dlg
         dlg.finished.connect(lambda _=None, k=key, d=dlg, sc=s, tg=target: self.on_countdown_finished(k, d, sc, tg))
-        self.show_normal()
+        # El overlay independiente debe aparecer sobre el juego; no elevamos la ventana principal.
         dlg.show()
-        dlg.raise_()
-        dlg.activateWindow()
 
     def on_countdown_finished(self, key, dlg, s, target):
         self.active_dialogs.pop(key, None)
@@ -1040,6 +1326,8 @@ class MainWindow(QMainWindow):
     def quit_app(self):
         self.config["start_minimized"] = self.start_min.isChecked()
         save_json(CONFIG_FILE, self.config)
+        if self.input_monitor and self.input_monitor.isRunning():
+            self.input_monitor.requestInterruption(); self.input_monitor.wait(1200)
         self.tray.hide()
         QApplication.quit()
 

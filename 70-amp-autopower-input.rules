@@ -1,0 +1,2 @@
+# AMP AutoPower: el usuario de la sesión/seat activa puede leer los dispositivos de entrada.
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT}=="1", TAG+="uaccess"

@@ -67,3 +67,11 @@ Registros y respaldos:
 Instalación de usuario:
 
 `~/.local/share/amp-autopower/`
+
+## v1.2.1 — Juegos fullscreen e inactividad global
+
+- Overlay de emergencia sobre juegos y pantalla completa.
+- Avisos previos keep-above.
+- Monitor global evdev para mouse, teclado, touch y mandos USB/Bluetooth/wireless.
+- Cada programación puede exigir minutos mínimos de inactividad.
+- No se registran teclas, botones ni coordenadas; solo tiempo de última actividad.
