@@ -8,6 +8,7 @@ Type=simple
 ExecStart=%h/.local/bin/amp-autopower
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=10s
 Environment=QT_QPA_PLATFORM=wayland
 
 [Install]

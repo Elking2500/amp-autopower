@@ -68,7 +68,7 @@ Instalación de usuario:
 
 `~/.local/share/amp-autopower/`
 
-## v1.2.1 — Juegos fullscreen e inactividad global
+## v1.2.2 — Juegos fullscreen e inactividad global
 
 - Overlay de emergencia sobre juegos y pantalla completa.
 - Avisos previos keep-above.

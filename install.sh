@@ -99,9 +99,9 @@ EOF
 fi
 
 if [[ "$MODE" == "update" ]]; then
-  # Dar tiempo al actualizador que lanzó este script para terminar su diálogo.
-  ( sleep 1; systemctl --user restart amp-autopower.service ) &
-  disown || true
+  # El instalador ya corre en su propia unidad systemd transitoria,
+  # fuera del cgroup de AMP AutoPower.
+  systemctl --user restart amp-autopower.service
 else
   systemctl --user restart amp-autopower.service 2>/dev/null || systemctl --user start amp-autopower.service
 fi

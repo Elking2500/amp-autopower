@@ -4,6 +4,8 @@ import json
 import os
 import re
 import select
+import socket
+import threading
 import time
 import shutil
 import subprocess
@@ -38,7 +40,7 @@ except Exception:
 
 APP_NAME = "AMP AutoPower"
 APP_ID = "amp-autopower"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 IPC_NAME = "amp-autopower-ipc-v1"
 CONFIG_DIR = Path.home() / ".config" / APP_ID
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -75,6 +77,31 @@ def log(msg: str):
 def run_cmd(cmd):
     log("Ejecutando: " + " ".join(str(x) for x in cmd))
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+_URLLIB_IPV4_LOCK = threading.Lock()
+
+
+def urlopen_ipv4(request, timeout=15):
+    """Abre una URL por IPv4 sin modificar la configuración IPv6 del sistema."""
+    with _URLLIB_IPV4_LOCK:
+        original_getaddrinfo = socket.getaddrinfo
+
+        def ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
+            return original_getaddrinfo(
+                host,
+                port,
+                socket.AF_INET,
+                type,
+                proto,
+                flags,
+            )
+
+        socket.getaddrinfo = ipv4_only
+        try:
+            return urllib.request.urlopen(request, timeout=timeout)
+        finally:
+            socket.getaddrinfo = original_getaddrinfo
 
 
 def version_tuple(value: str):
@@ -230,7 +257,7 @@ class UpdateCheckThread(QThread):
                     self.manifest_url,
                     headers={"User-Agent": f"AMP-AutoPower/{APP_VERSION}"},
                 )
-                with urllib.request.urlopen(req, timeout=15) as r:
+                with urlopen_ipv4(req, timeout=15) as r:
                     raw = r.read(256 * 1024)
                 manifest = json.loads(raw.decode("utf-8"))
                 version = str(manifest.get("version", "")).strip()
@@ -268,7 +295,7 @@ class DownloadThread(QThread):
             version = self.info["version"]
             out = UPDATE_CACHE_DIR / f"AMP-AutoPower-CachyOS-v{version}.tar.gz"
             req = urllib.request.Request(url, headers={"User-Agent": f"AMP-AutoPower/{APP_VERSION}"})
-            with urllib.request.urlopen(req, timeout=30) as r, out.open("wb") as f:
+            with urlopen_ipv4(req, timeout=30) as r, out.open("wb") as f:
                 total = int(r.headers.get("Content-Length") or 0)
                 done = 0
                 while True:
@@ -1284,15 +1311,22 @@ class MainWindow(QMainWindow):
             if not installers:
                 raise ValueError("No se encontró install.sh junto al programa dentro del paquete.")
             installer = min(installers, key=lambda p: len(p.parts))
-            update_log = LOG_DIR / "update.log"
             ensure_dirs()
-            lf = update_log.open("a", encoding="utf-8")
-            log(f"Iniciando actualización desde {path} a v{ver}")
+            unit_name = f"amp-autopower-update-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+            log(f"Iniciando actualización desde {path} a v{ver} mediante {unit_name}")
             subprocess.Popen(
-                ["bash", str(installer), "--update"],
-                cwd=str(installer.parent),
-                stdout=lf,
-                stderr=subprocess.STDOUT,
+                [
+                    "systemd-run",
+                    "--user",
+                    "--quiet",
+                    "--collect",
+                    f"--unit={unit_name}",
+                    "/usr/bin/bash",
+                    str(installer),
+                    "--update",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
             QMessageBox.information(

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.2
+
+- Corregida la búsqueda de actualizaciones que podía tardar ~60 segundos con urllib e IPv6.
+- El canal de actualizaciones usa IPv4 sin desactivar IPv6 en el sistema.
+- La descarga de actualizaciones utiliza la misma ruta IPv4 rápida.
+- El reinicio posterior a una actualización se programa fuera del cgroup de AMP AutoPower.
+- Añadido TimeoutStopSec=10s para evitar esperas excesivas al detener el servicio.
+
 ## 1.2.1
 
 - Overlay de emergencia probado sobre juegos Linux y Wine/Proton a pantalla completa.
