@@ -1,6 +1,6 @@
 {
-  "version": "1.2.2",
-  "package_url": "https://github.com/Elking2500/amp-autopower/releases/download/v1.2.2/AMP-AutoPower-CachyOS-v1.2.2.tar.gz",
-  "sha256": "5e754d822cba7243e3b99216ad814c5bdd4bf119aa07da5b9d189ef8a191aa8e",
-  "notes": "AMP AutoPower v1.2.2: búsqueda de actualizaciones mucho más rápida, ruta IPv4 exclusiva para el actualizador sin desactivar IPv6 del sistema, reinicio de actualización reducido a aproximadamente 1 segundo y corrección de registros duplicados."
+  "version": "1.3.0",
+  "package_url": "https://github.com/Elking2500/amp-autopower/releases/download/v1.3.0/AMP-AutoPower-CachyOS-v1.3.0.tar.gz",
+  "sha256": "9409ba9ecf00d0d46dd24542dc27f8bdfd74ca1fa7a63ccc878aa13e0eafb000",
+  "notes": "AMP AutoPower v1.3.0: programación opcional exclusivamente por inactividad, cierre seguro de aplicaciones y Google Chrome antes de apagar o reiniciar, espera automática de Wayland al iniciar y actualizador mejorado que reinicia AMP AutoPower únicamente después de pulsar OK."
 }
