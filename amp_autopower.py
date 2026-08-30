@@ -24,6 +24,7 @@ from condition_engine import (
     CPUMonitor,
     ConditionContext,
     ConditionEngine,
+    NetworkMonitor,
     ScheduledOccurrence,
     schedule_trigger_mode,
 )
@@ -208,6 +209,15 @@ class Schedule:
     cpu_duration_seconds: int = 300
     cpu_use_average: bool = False
     cpu_average_seconds: int = 60
+    require_network: bool = False
+    network_interface: str = ""
+    network_direction: str = "both"
+    network_comparison: str = "less"
+    network_threshold: int = 50
+    network_unit: str = "KB/s"
+    network_duration_seconds: int = 300
+    network_use_average: bool = False
+    network_average_seconds: int = 60
     close_apps_first: bool = True
 
 
@@ -224,6 +234,19 @@ def schedule_to_dict(schedule):
             "cpu_duration_seconds",
             "cpu_use_average",
             "cpu_average_seconds",
+        ):
+            data.pop(key, None)
+    if not schedule.require_network:
+        for key in (
+            "require_network",
+            "network_interface",
+            "network_direction",
+            "network_comparison",
+            "network_threshold",
+            "network_unit",
+            "network_duration_seconds",
+            "network_use_average",
+            "network_average_seconds",
         ):
             data.pop(key, None)
     return data
@@ -243,6 +266,7 @@ DEFAULT_CONFIG = {
     "update_manifest_url": CANONICAL_UPDATE_MANIFEST_URL,
     "notify_updates": True,
     "cpu_settings": {},
+    "network_settings": {},
     "schedules": [schedule_to_dict(Schedule())],
 }
 
@@ -718,6 +742,89 @@ class ScheduleEditor(QDialog):
             max(1, int(getattr(s, "cpu_average_seconds", 60)))
         )
 
+        self.require_network = QCheckBox("Usar condición de red")
+        self.require_network.setChecked(
+            getattr(s, "require_network", False)
+        )
+
+        self.network_interface = QComboBox()
+        configured_interface = str(getattr(s, "network_interface", ""))
+        monitor = getattr(parent, "network_monitor", None)
+        interfaces = (
+            monitor.available_interfaces()
+            if monitor is not None
+            else NetworkMonitor.discover_interfaces()
+        )
+        if configured_interface and configured_interface not in interfaces:
+            self.network_interface.addItem(
+                f"{configured_interface} (no disponible)",
+                configured_interface,
+            )
+        for interface in interfaces:
+            self.network_interface.addItem(interface, interface)
+        if self.network_interface.count() == 0:
+            self.network_interface.addItem("Sin interfaces disponibles", "")
+        network_interface_index = self.network_interface.findData(
+            configured_interface
+        )
+        if network_interface_index >= 0:
+            self.network_interface.setCurrentIndex(network_interface_index)
+
+        self.network_direction = QComboBox()
+        self.network_direction.addItem("Entrada (RX)", "rx")
+        self.network_direction.addItem("Salida (TX)", "tx")
+        self.network_direction.addItem("Ambas (RX + TX)", "both")
+        network_direction_index = self.network_direction.findData(
+            getattr(s, "network_direction", "both")
+        )
+        self.network_direction.setCurrentIndex(max(0, network_direction_index))
+
+        self.network_comparison = QComboBox()
+        self.network_comparison.addItem("Menor que", "less")
+        self.network_comparison.addItem("Mayor que", "greater")
+        network_comparison_index = self.network_comparison.findData(
+            getattr(s, "network_comparison", "less")
+        )
+        self.network_comparison.setCurrentIndex(
+            max(0, network_comparison_index)
+        )
+
+        self.network_threshold = QSpinBox()
+        self.network_threshold.setRange(0, 1000000)
+        self.network_threshold.setValue(
+            max(0, int(getattr(s, "network_threshold", 50)))
+        )
+
+        self.network_unit = QComboBox()
+        self.network_unit.addItem("KB/s", "KB/s")
+        self.network_unit.addItem("MB/s", "MB/s")
+        network_unit_index = self.network_unit.findData(
+            getattr(s, "network_unit", "KB/s")
+        )
+        self.network_unit.setCurrentIndex(max(0, network_unit_index))
+        network_threshold_row = QHBoxLayout()
+        network_threshold_row.addWidget(self.network_threshold)
+        network_threshold_row.addWidget(self.network_unit)
+
+        self.network_duration = QSpinBox()
+        self.network_duration.setRange(1, 86400)
+        self.network_duration.setSuffix(" s")
+        self.network_duration.setValue(
+            max(1, int(getattr(s, "network_duration_seconds", 300)))
+        )
+
+        self.network_use_average = QCheckBox("Usar promedio móvil")
+        self.network_use_average.setChecked(
+            getattr(s, "network_use_average", False)
+        )
+
+        self.network_average = QSpinBox()
+        self.network_average.setRange(2, 3600)
+        self.network_average.setSuffix(" s")
+        self.network_average.setValue(
+            max(2, int(getattr(s, "network_average_seconds", 60)))
+        )
+
         self.close_apps = QCheckBox(
             "Cerrar aplicaciones correctamente antes de apagar/reiniciar"
         )
@@ -740,6 +847,14 @@ class ScheduleEditor(QDialog):
         form.addRow("Duración continua CPU:", self.cpu_duration)
         form.addRow("Promedio CPU:", self.cpu_use_average)
         form.addRow("Ventana del promedio:", self.cpu_average)
+        form.addRow("Red:", self.require_network)
+        form.addRow("Interfaz:", self.network_interface)
+        form.addRow("Dirección:", self.network_direction)
+        form.addRow("Comparación de red:", self.network_comparison)
+        form.addRow("Umbral de red:", network_threshold_row)
+        form.addRow("Duración continua de red:", self.network_duration)
+        form.addRow("Promedio de red:", self.network_use_average)
+        form.addRow("Ventana de red:", self.network_average)
         form.addRow("Cierre seguro:", self.close_apps)
 
         root.addLayout(form)
@@ -799,10 +914,15 @@ class ScheduleEditor(QDialog):
         self.require_idle.toggled.connect(self._refresh_mode_controls)
         self.require_cpu.toggled.connect(self._refresh_cpu_controls)
         self.cpu_use_average.toggled.connect(self._refresh_cpu_controls)
+        self.require_network.toggled.connect(self._refresh_network_controls)
+        self.network_use_average.toggled.connect(
+            self._refresh_network_controls
+        )
         self.action.currentIndexChanged.connect(self._refresh_action_controls)
 
         self._refresh_mode_controls()
         self._refresh_cpu_controls()
+        self._refresh_network_controls()
         self._refresh_action_controls()
 
     def _refresh_mode_controls(self):
@@ -836,6 +956,19 @@ class ScheduleEditor(QDialog):
         self.cpu_use_average.setEnabled(enabled)
         self.cpu_average.setEnabled(
             enabled and self.cpu_use_average.isChecked()
+        )
+
+    def _refresh_network_controls(self):
+        enabled = self.require_network.isChecked()
+        self.network_interface.setEnabled(enabled)
+        self.network_direction.setEnabled(enabled)
+        self.network_comparison.setEnabled(enabled)
+        self.network_threshold.setEnabled(enabled)
+        self.network_unit.setEnabled(enabled)
+        self.network_duration.setEnabled(enabled)
+        self.network_use_average.setEnabled(enabled)
+        self.network_average.setEnabled(
+            enabled and self.network_use_average.isChecked()
         )
 
     def _refresh_action_controls(self):
@@ -891,6 +1024,15 @@ class ScheduleEditor(QDialog):
             cpu_duration_seconds=self.cpu_duration.value(),
             cpu_use_average=self.cpu_use_average.isChecked(),
             cpu_average_seconds=self.cpu_average.value(),
+            require_network=self.require_network.isChecked(),
+            network_interface=self.network_interface.currentData() or "",
+            network_direction=self.network_direction.currentData(),
+            network_comparison=self.network_comparison.currentData(),
+            network_threshold=self.network_threshold.value(),
+            network_unit=self.network_unit.currentData(),
+            network_duration_seconds=self.network_duration.value(),
+            network_use_average=self.network_use_average.isChecked(),
+            network_average_seconds=self.network_average.value(),
             close_apps_first=(
                 self.close_apps.isChecked()
                 if action in ("poweroff", "reboot")
@@ -922,6 +1064,8 @@ class MainWindow(QMainWindow):
         self.condition_engine = ConditionEngine()
         self.cpu_monitor = CPUMonitor()
         self._last_cpu_monitor_error = None
+        self.network_monitor = NetworkMonitor()
+        self._last_network_monitor_error = None
         self._condition_wait_notified = {}
         self._reconcile_schedule_occurrences(
             self.schedules(),
@@ -1109,12 +1253,17 @@ class MainWindow(QMainWindow):
     def schedules(self):
         out = []
         cpu_settings = self.config.get("cpu_settings", {})
+        network_settings = self.config.get("network_settings", {})
         for raw in self.config.get("schedules", []):
             try:
                 data = dict(raw)
                 preset = cpu_settings.get(data.get("id"), {})
                 if isinstance(preset, dict):
                     for key, value in preset.items():
+                        data.setdefault(key, value)
+                network_preset = network_settings.get(data.get("id"), {})
+                if isinstance(network_preset, dict):
+                    for key, value in network_preset.items():
                         data.setdefault(key, value)
                 out.append(Schedule(**data))
             except Exception as e:
@@ -1148,6 +1297,36 @@ class MainWindow(QMainWindow):
                 reset_cpu_ids.add(schedule_id)
         for schedule_id in reset_cpu_ids:
             self.condition_engine.runtime.clear_cpu_runtime(schedule_id)
+        network_fields = (
+            "enabled",
+            "use_time",
+            "trigger_mode",
+            "weekdays",
+            "require_network",
+            "network_interface",
+            "network_direction",
+            "network_comparison",
+            "network_threshold",
+            "network_unit",
+            "network_duration_seconds",
+            "network_use_average",
+            "network_average_seconds",
+        )
+        reset_network_ids = set(restart_ids) | (
+            previous_ids - set(schedules_by_id)
+        )
+        for schedule_id, schedule in schedules_by_id.items():
+            previous = previous_by_id.get(schedule_id)
+            if previous is None or any(
+                getattr(previous, field_name) != getattr(schedule, field_name)
+                for field_name in network_fields
+            ):
+                reset_network_ids.add(schedule_id)
+        for schedule_id in reset_network_ids:
+            self.condition_engine.runtime.clear_condition_runtime(
+                schedule_id,
+                "network",
+            )
         for dlg in list(self.active_dialogs.values()):
             dialog_schedule = getattr(dlg, "schedule", None)
             schedule_id = getattr(dialog_schedule, "id", None)
@@ -1182,12 +1361,34 @@ class MainWindow(QMainWindow):
                 cpu_settings[schedule.id] = configured
             else:
                 cpu_settings.pop(schedule.id, None)
-        self.config["schedules"] = [schedule_to_dict(s) for s in schedules]
-        save_json(CONFIG_FILE, self.config)
-
+        network_settings = self.config.setdefault("network_settings", {})
+        network_defaults = {
+            "network_interface": "",
+            "network_direction": "both",
+            "network_comparison": "less",
+            "network_threshold": 50,
+            "network_unit": "KB/s",
+            "network_duration_seconds": 300,
+            "network_use_average": False,
+            "network_average_seconds": 60,
+        }
+        for schedule in schedules:
+            configured = {
+                key: getattr(schedule, key)
+                for key in network_defaults
+            }
+            if configured != network_defaults:
+                network_settings[schedule.id] = configured
+            else:
+                network_settings.pop(schedule.id, None)
         removed_ids = previous_ids - set(schedules_by_id)
         for schedule_id in removed_ids:
             cpu_settings.pop(schedule_id, None)
+            network_settings.pop(schedule_id, None)
+        self.config["schedules"] = [schedule_to_dict(s) for s in schedules]
+        save_json(CONFIG_FILE, self.config)
+
+        for schedule_id in removed_ids:
             for state_key in (
                 "last_runs",
                 "snoozes",
@@ -1387,6 +1588,31 @@ class MainWindow(QMainWindow):
                 cpu_average = reading.average_percent
                 cpu_reliable = reading.reliable
                 cpu_status = reading.reason
+        network_rx = None
+        network_tx = None
+        network_speed = None
+        network_average = None
+        network_reliable = False
+        network_status = "network_monitor_unavailable"
+        if getattr(s, "require_network", False):
+            monitor = getattr(self, "network_monitor", None)
+            if monitor is not None:
+                average_window = (
+                    int(getattr(s, "network_average_seconds", 60))
+                    if getattr(s, "network_use_average", False)
+                    else 0
+                )
+                reading = monitor.reading(
+                    getattr(s, "network_interface", ""),
+                    getattr(s, "network_direction", "both"),
+                    average_window,
+                )
+                network_rx = reading.rx_bytes_per_second
+                network_tx = reading.tx_bytes_per_second
+                network_speed = reading.speed_bytes_per_second
+                network_average = reading.average_bytes_per_second
+                network_reliable = reading.reliable
+                network_status = reading.reason
         context = ConditionContext(
             now=now,
             occurrence=occurrence,
@@ -1397,6 +1623,12 @@ class MainWindow(QMainWindow):
             cpu_average=cpu_average,
             cpu_reliable=cpu_reliable,
             cpu_status=cpu_status,
+            network_rx_bytes_per_second=network_rx,
+            network_tx_bytes_per_second=network_tx,
+            network_speed_bytes_per_second=network_speed,
+            network_average_bytes_per_second=network_average,
+            network_reliable=network_reliable,
+            network_status=network_status,
         )
         return self.condition_engine.evaluate(s, context)
 
@@ -1502,6 +1734,39 @@ class MainWindow(QMainWindow):
                 )
                 reasons.append(
                     f"La CPU debe ser {comparison} {info.get('threshold'):g} %."
+                )
+
+        network_result = evaluation.for_type("network")
+        if (
+            network_result
+            and network_result.enabled
+            and not network_result.satisfied
+        ):
+            info = network_result.info
+            if not info.get("reliable"):
+                delays.append(30)
+                reasons.append(
+                    "La condición de red no está disponible "
+                    f"({network_result.reason})."
+                )
+            elif info.get("threshold_met"):
+                elapsed = network_result.satisfied_for_seconds or 0
+                missing = max(
+                    1,
+                    int(info.get("minimum_seconds", 0) - elapsed + 1),
+                )
+                delays.append(missing)
+                reasons.append("La red aún no cumple la duración continua.")
+            else:
+                delays.append(30)
+                comparison = (
+                    "mayor que"
+                    if info.get("comparison") == "greater"
+                    else "menor que"
+                )
+                threshold_kib = float(info.get("threshold", 0)) / 1024
+                reasons.append(
+                    f"La red debe ser {comparison} {threshold_kib:g} KB/s."
                 )
 
         if not reasons:
@@ -2006,6 +2271,17 @@ class MainWindow(QMainWindow):
                 self._last_cpu_monitor_error = cpu_reading.reason
             elif cpu_reading.reliable:
                 self._last_cpu_monitor_error = None
+        if any(s.enabled and s.require_network for s in schedules):
+            network_status = self.network_monitor.sample()
+            if (
+                not network_status.reliable
+                and network_status.reason.startswith("network_monitor_error")
+                and network_status.reason != self._last_network_monitor_error
+            ):
+                log(f"Monitor de red no disponible: {network_status.reason}")
+                self._last_network_monitor_error = network_status.reason
+            elif network_status.reliable:
+                self._last_network_monitor_error = None
 
         for s in schedules:
             if not s.enabled:

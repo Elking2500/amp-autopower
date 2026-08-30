@@ -8,6 +8,7 @@ from amp_autopower import MainWindow, Schedule, schedule_to_dict
 from condition_engine import (
     CPUReading,
     ConditionEngine,
+    NetworkReading,
     ScheduledOccurrence,
     schedule_trigger_mode,
 )
@@ -39,6 +40,7 @@ class SchedulerHarness:
         idle_seconds=0,
         reliable=True,
         cpu_reading=None,
+        network_reading=None,
     ):
         self.state = state
         self.condition_engine = ConditionEngine()
@@ -57,6 +59,19 @@ class SchedulerHarness:
         )
         self.cpu_monitor = SimpleNamespace(
             reading=lambda _window=0: self._cpu_reading,
+        )
+        self._network_reading = network_reading or NetworkReading(
+            None,
+            None,
+            None,
+            None,
+            False,
+            "network_monitor_warming_up",
+        )
+        self.network_monitor = SimpleNamespace(
+            reading=lambda _interface, _direction, _window=0: (
+                self._network_reading
+            ),
         )
         self.started = []
 
@@ -78,11 +93,16 @@ class SchedulerHarness:
     def schedules(self):
         out = []
         cpu_settings = self.config.get("cpu_settings", {})
+        network_settings = self.config.get("network_settings", {})
         for raw in self.config.get("schedules", []):
             data = dict(raw)
             preset = cpu_settings.get(data.get("id"), {})
             if isinstance(preset, dict):
                 for key, value in preset.items():
+                    data.setdefault(key, value)
+            network_preset = network_settings.get(data.get("id"), {})
+            if isinstance(network_preset, dict):
+                for key, value in network_preset.items():
                     data.setdefault(key, value)
             out.append(Schedule(**data))
         return out
@@ -126,6 +146,8 @@ class SchedulerCompatibilityTests(unittest.TestCase):
             self.assertNotIn("interval_minutes", serialized)
             self.assertNotIn("require_cpu", serialized)
             self.assertNotIn("cpu_threshold", serialized)
+            self.assertNotIn("require_network", serialized)
+            self.assertNotIn("network_threshold", serialized)
 
     def test_disabled_cpu_preserves_custom_configuration(self):
         item = Schedule(
@@ -159,6 +181,45 @@ class SchedulerCompatibilityTests(unittest.TestCase):
         self.assertEqual(restored.cpu_duration_seconds, 30)
         self.assertTrue(restored.cpu_use_average)
         self.assertEqual(restored.cpu_average_seconds, 15)
+
+    def test_disabled_network_preserves_custom_configuration(self):
+        item = Schedule(
+            id="network",
+            require_network=False,
+            network_interface="tailscale0",
+            network_direction="tx",
+            network_comparison="greater",
+            network_threshold=2,
+            network_unit="MB/s",
+            network_duration_seconds=30,
+            network_use_average=True,
+            network_average_seconds=15,
+        )
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+
+        with patch("amp_autopower.save_json"):
+            harness.set_schedules([item])
+
+        serialized = harness.config["schedules"][0]
+        restored = harness.schedules()[0]
+        self.assertNotIn("require_network", serialized)
+        self.assertNotIn("network_interface", serialized)
+        self.assertFalse(restored.require_network)
+        self.assertEqual(restored.network_interface, "tailscale0")
+        self.assertEqual(restored.network_direction, "tx")
+        self.assertEqual(restored.network_comparison, "greater")
+        self.assertEqual(restored.network_threshold, 2)
+        self.assertEqual(restored.network_unit, "MB/s")
+        self.assertEqual(restored.network_duration_seconds, 30)
+        self.assertTrue(restored.network_use_average)
+        self.assertEqual(restored.network_average_seconds, 15)
 
     def test_switching_interval_to_time_discards_interval_occurrence(self):
         interval = Schedule(
@@ -460,6 +521,10 @@ class SchedulerCompatibilityTests(unittest.TestCase):
         }
         harness = SchedulerHarness(state)
         harness.config["schedules"] = [asdict(item)]
+        harness.config["cpu_settings"] = {item.id: {"cpu_threshold": 25}}
+        harness.config["network_settings"] = {
+            item.id: {"network_interface": "enp1s0"}
+        }
 
         with patch("amp_autopower.save_json"):
             harness.set_schedules([], now=target)
@@ -472,6 +537,8 @@ class SchedulerCompatibilityTests(unittest.TestCase):
             "completed_intervals",
         ):
             self.assertNotIn(item.id, state[state_key])
+        self.assertNotIn(item.id, harness.config["cpu_settings"])
+        self.assertNotIn(item.id, harness.config["network_settings"])
 
     def test_completed_interval_is_disabled_and_not_restarted(self):
         item = Schedule(
@@ -706,6 +773,44 @@ class SchedulerCompatibilityTests(unittest.TestCase):
         self.assertEqual(persisted.scheduled_target, target)
         self.assertEqual(harness.started, [])
 
+    def test_time_and_network_pending_keeps_original_target(self):
+        target = datetime(2026, 8, 31, 23, 30)
+        occurrence = ScheduledOccurrence.create("timed", target, 60)
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {"timed": occurrence.to_state()},
+        }
+        item = Schedule(
+            id="timed",
+            time="23:30",
+            weekdays=[0],
+            require_network=True,
+            network_interface="enp1s0",
+            network_threshold=50,
+            network_duration_seconds=300,
+        )
+        harness = SchedulerHarness(
+            state,
+            network_reading=NetworkReading(
+                60 * 1024,
+                10 * 1024,
+                70 * 1024,
+                None,
+                True,
+                "network_sample_available",
+            ),
+        )
+
+        with patch("amp_autopower.save_json"):
+            harness._pending_occurrence_tick(item, occurrence, target)
+
+        persisted = harness.pending_occurrence(item)
+        self.assertTrue(persisted.armed)
+        self.assertEqual(persisted.scheduled_target, target)
+        self.assertEqual(harness.started, [])
+
     def test_editing_cpu_condition_resets_continuous_duration(self):
         started = datetime(2026, 8, 31, 22, 0)
         state = {
@@ -828,6 +933,208 @@ class SchedulerCompatibilityTests(unittest.TestCase):
         self.assertEqual(persisted.start_at, start)
         self.assertEqual(persisted.scheduled_target, target)
         self.assertEqual(harness.started, [])
+
+    def test_interval_and_network_pending_keeps_start_and_target(self):
+        start = datetime(2026, 8, 31, 22, 30)
+        occurrence = ScheduledOccurrence.create_interval(
+            "interval",
+            start,
+            60,
+            60,
+        )
+        target = occurrence.scheduled_target
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {"interval": occurrence.to_state()},
+            "completed_intervals": {},
+        }
+        item = Schedule(
+            id="interval",
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=60,
+            weekdays=[],
+            require_network=True,
+            network_interface="wlan0",
+            network_threshold=50,
+            network_duration_seconds=300,
+        )
+        harness = SchedulerHarness(
+            state,
+            network_reading=NetworkReading(
+                60 * 1024,
+                10 * 1024,
+                70 * 1024,
+                None,
+                True,
+                "network_sample_available",
+            ),
+        )
+
+        with patch("amp_autopower.save_json"):
+            harness._pending_occurrence_tick(item, occurrence, target)
+
+        persisted = harness.pending_occurrence(item)
+        self.assertTrue(persisted.armed)
+        self.assertEqual(persisted.start_at, start)
+        self.assertEqual(persisted.scheduled_target, target)
+        self.assertEqual(harness.started, [])
+
+    def test_network_snooze_keeps_original_interval_and_configuration(self):
+        start = datetime(2026, 8, 31, 22, 30)
+        occurrence = ScheduledOccurrence.create_interval(
+            "interval",
+            start,
+            60,
+            60,
+        ).mark_armed()
+        target = occurrence.scheduled_target
+        snooze = target + timedelta(minutes=10)
+        state = {
+            "last_runs": {},
+            "snoozes": {"interval": snooze.isoformat()},
+            "skipped_targets": {},
+            "pending_occurrences": {"interval": occurrence.to_state()},
+            "completed_intervals": {},
+        }
+        item = Schedule(
+            id="interval",
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=60,
+            weekdays=[],
+            require_network=True,
+            network_interface="tailscale0",
+            network_threshold=50,
+            network_duration_seconds=300,
+        )
+        harness = SchedulerHarness(
+            state,
+            network_reading=NetworkReading(
+                60 * 1024,
+                10 * 1024,
+                70 * 1024,
+                None,
+                True,
+                "network_sample_available",
+            ),
+        )
+
+        with patch("amp_autopower.save_json"):
+            harness._pending_occurrence_tick(
+                item,
+                occurrence,
+                snooze - timedelta(seconds=60),
+            )
+
+        persisted = harness.pending_occurrence(item)
+        self.assertEqual(persisted.start_at, start)
+        self.assertEqual(persisted.scheduled_target, target)
+        self.assertEqual(item.network_interface, "tailscale0")
+        self.assertEqual(item.network_duration_seconds, 300)
+        self.assertEqual(harness.started, [])
+
+    def test_missing_network_interface_never_starts_countdown(self):
+        target = datetime(2026, 8, 31, 23, 30)
+        occurrence = ScheduledOccurrence.create(
+            "timed",
+            target,
+            60,
+        ).mark_armed()
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {"timed": occurrence.to_state()},
+        }
+        item = Schedule(
+            id="timed",
+            time="23:30",
+            weekdays=[0],
+            require_network=True,
+            network_interface="missing0",
+            network_duration_seconds=0,
+        )
+        harness = SchedulerHarness(
+            state,
+            network_reading=NetworkReading(
+                None,
+                None,
+                None,
+                None,
+                False,
+                "network_interface_unavailable",
+            ),
+        )
+
+        with patch("amp_autopower.save_json"):
+            harness._pending_occurrence_tick(
+                item,
+                occurrence,
+                target + timedelta(minutes=10),
+            )
+
+        self.assertEqual(harness.started, [])
+        self.assertEqual(
+            harness.pending_occurrence(item).scheduled_target,
+            target,
+        )
+
+    def test_network_pending_can_cross_midnight_without_changing_target(self):
+        target = datetime(2026, 9, 4, 23, 30)
+        occurrence = ScheduledOccurrence.create(
+            "timed",
+            target,
+            60,
+        ).mark_armed()
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {"timed": occurrence.to_state()},
+        }
+        item = Schedule(
+            id="timed",
+            time="23:30",
+            weekdays=[4],
+            require_network=True,
+            network_interface="enp1s0",
+            network_threshold=50,
+            network_duration_seconds=60,
+        )
+        harness = SchedulerHarness(
+            state,
+            network_reading=NetworkReading(
+                10 * 1024,
+                5 * 1024,
+                15 * 1024,
+                None,
+                True,
+                "network_sample_available",
+            ),
+        )
+
+        with patch("amp_autopower.save_json"):
+            harness._pending_occurrence_tick(item, occurrence, target)
+            persisted = harness.pending_occurrence(item)
+            for seconds in range(1, 40 * 60 + 1):
+                harness.evaluate_conditions(
+                    item,
+                    target + timedelta(seconds=seconds),
+                    persisted,
+                    pending=True,
+                )
+            harness._pending_occurrence_tick(
+                item,
+                persisted,
+                target + timedelta(minutes=40),
+            )
+
+        self.assertEqual(len(harness.started), 1)
+        self.assertEqual(harness.started[0][1], target)
+        self.assertEqual(harness.pending_occurrence(item).scheduled_target, target)
 
     def test_cpu_snooze_keeps_original_interval_and_target(self):
         start = datetime(2026, 8, 31, 22, 30)

@@ -476,6 +476,247 @@ class ConditionEngineTests(unittest.TestCase):
         self.assertFalse(waiting.for_type("idle").satisfied)
         self.assertTrue(ready.ready_for_countdown)
 
+    def test_network_less_and_greater_comparisons(self):
+        less_schedule = schedule(
+            require_network=True,
+            network_interface="enp1s0",
+            network_direction="rx",
+            network_comparison="less",
+            network_threshold=50,
+            network_unit="KB/s",
+            network_duration_seconds=0,
+        )
+        greater_schedule = schedule(
+            **{
+                **less_schedule.__dict__,
+                "network_comparison": "greater",
+            }
+        )
+        now = MONDAY_TARGET - timedelta(seconds=60)
+        low = self.engine.evaluate(
+            less_schedule,
+            context(
+                now,
+                network_rx_bytes_per_second=40 * 1024,
+                network_tx_bytes_per_second=5 * 1024,
+                network_speed_bytes_per_second=40 * 1024,
+                network_reliable=True,
+                network_status="network_sample_available",
+            ),
+        )
+        high = self.engine.evaluate(
+            greater_schedule,
+            context(
+                now,
+                network_rx_bytes_per_second=60 * 1024,
+                network_tx_bytes_per_second=5 * 1024,
+                network_speed_bytes_per_second=60 * 1024,
+                network_reliable=True,
+                network_status="network_sample_available",
+            ),
+        )
+
+        self.assertTrue(low.for_type("network").satisfied)
+        self.assertTrue(high.for_type("network").satisfied)
+        self.assertEqual(low.for_type("network").info["direction"], "rx")
+
+    def test_network_megabytes_unit_converts_threshold(self):
+        result = self.engine.evaluate(
+            schedule(
+                require_network=True,
+                network_interface="enp1s0",
+                network_threshold=1,
+                network_unit="MB/s",
+                network_duration_seconds=0,
+            ),
+            context(
+                MONDAY_TARGET - timedelta(seconds=60),
+                network_speed_bytes_per_second=512 * 1024,
+                network_reliable=True,
+                network_status="network_sample_available",
+            ),
+        )
+
+        self.assertTrue(result.for_type("network").satisfied)
+        self.assertEqual(result.for_type("network").info["threshold"], 1024**2)
+
+    def test_network_continuous_duration_resets_when_threshold_breaks(self):
+        item = schedule(
+            require_network=True,
+            network_interface="wlan0",
+            network_direction="both",
+            network_threshold=50,
+            network_unit="KB/s",
+            network_duration_seconds=30,
+        )
+        started = MONDAY_TARGET - timedelta(minutes=2)
+        results = []
+        for seconds in range(31):
+            results.append(self.engine.evaluate(
+                item,
+                context(
+                    started + timedelta(seconds=seconds),
+                    network_rx_bytes_per_second=20 * 1024,
+                    network_tx_bytes_per_second=10 * 1024,
+                    network_speed_bytes_per_second=30 * 1024,
+                    network_reliable=True,
+                    network_status="network_sample_available",
+                ),
+            ))
+        broken = self.engine.evaluate(
+            item,
+            context(
+                started + timedelta(seconds=31),
+                network_rx_bytes_per_second=50 * 1024,
+                network_tx_bytes_per_second=10 * 1024,
+                network_speed_bytes_per_second=60 * 1024,
+                network_reliable=True,
+                network_status="network_sample_available",
+            ),
+        )
+        restarted = self.engine.evaluate(
+            item,
+            context(
+                started + timedelta(seconds=32),
+                network_speed_bytes_per_second=30 * 1024,
+                network_reliable=True,
+                network_status="network_sample_available",
+            ),
+        )
+
+        self.assertFalse(results[0].for_type("network").satisfied)
+        self.assertTrue(results[30].for_type("network").satisfied)
+        self.assertFalse(broken.for_type("network").satisfied)
+        self.assertFalse(restarted.for_type("network").satisfied)
+        self.assertEqual(restarted.for_type("network").satisfied_for_seconds, 0)
+
+    def test_network_average_is_used_when_enabled(self):
+        result = self.engine.evaluate(
+            schedule(
+                require_network=True,
+                network_interface="tailscale0",
+                network_threshold=50,
+                network_unit="KB/s",
+                network_duration_seconds=0,
+                network_use_average=True,
+            ),
+            context(
+                MONDAY_TARGET - timedelta(seconds=60),
+                network_speed_bytes_per_second=100 * 1024,
+                network_average_bytes_per_second=20 * 1024,
+                network_reliable=True,
+                network_status="network_average_available",
+            ),
+        )
+
+        self.assertTrue(result.for_type("network").satisfied)
+        self.assertEqual(
+            result.for_type("network").info["value_bytes_per_second"],
+            20 * 1024,
+        )
+
+    def test_network_unavailable_is_not_satisfied(self):
+        result = self.engine.evaluate(
+            schedule(
+                require_network=True,
+                network_interface="missing0",
+                network_duration_seconds=0,
+            ),
+            context(
+                MONDAY_TARGET - timedelta(seconds=60),
+                network_reliable=False,
+                network_status="network_interface_unavailable",
+            ),
+        )
+
+        self.assertFalse(result.for_type("network").satisfied)
+        self.assertFalse(result.ready_for_countdown)
+        self.assertEqual(
+            result.for_type("network").reason,
+            "network_interface_unavailable",
+        )
+
+    def test_cpu_and_network_use_and_semantics(self):
+        item = schedule(
+            require_cpu=True,
+            cpu_threshold=10,
+            cpu_duration_seconds=0,
+            require_network=True,
+            network_interface="enp1s0",
+            network_threshold=50,
+            network_unit="KB/s",
+            network_duration_seconds=0,
+        )
+        now = MONDAY_TARGET - timedelta(seconds=60)
+        waiting = self.engine.evaluate(
+            item,
+            context(
+                now,
+                cpu_usage=5,
+                cpu_reliable=True,
+                cpu_status="cpu_sample_available",
+                network_speed_bytes_per_second=60 * 1024,
+                network_reliable=True,
+                network_status="network_sample_available",
+            ),
+        )
+        ready = self.engine.evaluate(
+            item,
+            context(
+                now,
+                cpu_usage=5,
+                cpu_reliable=True,
+                cpu_status="cpu_sample_available",
+                network_speed_bytes_per_second=20 * 1024,
+                network_reliable=True,
+                network_status="network_sample_available",
+            ),
+        )
+
+        self.assertFalse(waiting.ready_for_countdown)
+        self.assertTrue(waiting.for_type("cpu").satisfied)
+        self.assertFalse(waiting.for_type("network").satisfied)
+        self.assertTrue(ready.ready_for_countdown)
+
+    def test_idle_and_network_use_and_semantics(self):
+        item = schedule(
+            require_idle=True,
+            idle_minutes=30,
+            require_network=True,
+            network_interface="wlan0",
+            network_threshold=50,
+            network_unit="KB/s",
+            network_duration_seconds=0,
+        )
+        now = MONDAY_TARGET - timedelta(seconds=60)
+        waiting = self.engine.evaluate(
+            item,
+            context(
+                now,
+                idle_seconds=10 * 60,
+                idle_reliable=True,
+                network_speed_bytes_per_second=20 * 1024,
+                network_reliable=True,
+                network_status="network_sample_available",
+            ),
+        )
+        ready = self.engine.evaluate(
+            item,
+            context(
+                now,
+                idle_seconds=30 * 60,
+                idle_reliable=True,
+                network_speed_bytes_per_second=20 * 1024,
+                network_reliable=True,
+                network_status="network_sample_available",
+            ),
+        )
+
+        self.assertFalse(waiting.ready_for_countdown)
+        self.assertTrue(waiting.for_type("network").satisfied)
+        self.assertFalse(waiting.for_type("idle").satisfied)
+        self.assertTrue(ready.ready_for_countdown)
+
     def test_pending_time_and_idle_keeps_original_scheduled_target(self):
         item = occurrence()
         waiting = self.engine.evaluate(

@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.0-dev (en desarrollo)
+
+- Soporte en desarrollo para condiciones de actividad de red.
+
 ## 1.4.0-dev (en desarrollo)
 
 - Preparación interna de un motor extensible de condiciones.

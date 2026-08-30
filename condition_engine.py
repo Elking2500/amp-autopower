@@ -1,11 +1,31 @@
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 
 CONDITION_TYPES = ("time", "date", "interval", "idle", "cpu", "network")
 TRIGGER_MODES = ("time", "interval", "idle")
+
+
+def interpolate_counters(samples, cutoff: float, maximum_bracket: float):
+    before = [sample for sample in samples if sample[0] <= cutoff]
+    after = [sample for sample in samples if sample[0] >= cutoff]
+    if not before or not after:
+        return None
+    before_at, before_counters = before[-1]
+    after_at, after_counters = after[0]
+    if after_at == before_at:
+        return before_counters
+    bracket = after_at - before_at
+    if bracket > maximum_bracket:
+        return None
+    position = (cutoff - before_at) / bracket
+    return tuple(
+        before_value + (after_value - before_value) * position
+        for before_value, after_value in zip(before_counters, after_counters)
+    )
 
 
 def schedule_trigger_mode(schedule) -> str:
@@ -141,6 +161,12 @@ class ConditionContext:
     cpu_average: Optional[float] = None
     cpu_reliable: bool = False
     cpu_status: str = "cpu_monitor_unavailable"
+    network_rx_bytes_per_second: Optional[float] = None
+    network_tx_bytes_per_second: Optional[float] = None
+    network_speed_bytes_per_second: Optional[float] = None
+    network_average_bytes_per_second: Optional[float] = None
+    network_reliable: bool = False
+    network_status: str = "network_monitor_unavailable"
 
 
 @dataclass(frozen=True)
@@ -385,12 +411,105 @@ class CPUCondition(Condition):
         )
 
 
+class NetworkCondition(Condition):
+    condition_type = "network"
+
+    def __init__(
+        self,
+        interface: str,
+        direction: str,
+        comparison: str,
+        threshold_bytes_per_second: float,
+        minimum_seconds: int,
+        use_average: bool = False,
+        enabled: bool = True,
+    ):
+        super().__init__(enabled)
+        self.interface = str(interface)
+        self.direction = (
+            direction if direction in ("rx", "tx", "both") else "both"
+        )
+        self.comparison = (
+            "greater" if str(comparison).lower() == "greater" else "less"
+        )
+        self.threshold = max(0.0, float(threshold_bytes_per_second))
+        self.minimum_seconds = max(0, int(minimum_seconds))
+        self.use_average = bool(use_average)
+
+    def evaluate(self, context: ConditionContext) -> ConditionResult:
+        if not self.enabled:
+            return self.disabled_result()
+
+        value = (
+            context.network_average_bytes_per_second
+            if self.use_average
+            else context.network_speed_bytes_per_second
+        )
+        reliable = bool(context.network_reliable) and value is not None
+        threshold_met = False
+        if reliable:
+            if self.comparison == "greater":
+                threshold_met = value > self.threshold
+            else:
+                threshold_met = value < self.threshold
+
+        if not reliable:
+            reason = context.network_status or "network_monitor_unavailable"
+        elif threshold_met:
+            reason = "network_threshold_met"
+        else:
+            reason = "waiting_for_network_threshold"
+
+        return ConditionResult(
+            condition_type=self.condition_type,
+            enabled=True,
+            satisfied=threshold_met,
+            info={
+                "interface": self.interface,
+                "direction": self.direction,
+                "rx_bytes_per_second": context.network_rx_bytes_per_second,
+                "tx_bytes_per_second": context.network_tx_bytes_per_second,
+                "speed_bytes_per_second": (
+                    context.network_speed_bytes_per_second
+                ),
+                "average_bytes_per_second": (
+                    context.network_average_bytes_per_second
+                ),
+                "value_bytes_per_second": value,
+                "threshold": self.threshold,
+                "comparison": self.comparison,
+                "minimum_seconds": self.minimum_seconds,
+                "use_average": self.use_average,
+                "reliable": reliable,
+                "threshold_met": threshold_met,
+            },
+            reason=reason,
+        )
+
+
 @dataclass(frozen=True)
 class CPUReading:
     usage_percent: Optional[float]
     average_percent: Optional[float]
     reliable: bool
     reason: str
+
+
+@dataclass(frozen=True)
+class NetworkReading:
+    rx_bytes_per_second: Optional[float]
+    tx_bytes_per_second: Optional[float]
+    speed_bytes_per_second: Optional[float]
+    average_bytes_per_second: Optional[float]
+    reliable: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class NetworkMonitorStatus:
+    reliable: bool
+    reason: str
+    interfaces: Tuple[str, ...]
 
 
 class CPUMonitor:
@@ -526,38 +645,17 @@ class CPUMonitor:
             )
         newest_at, newest_counters = self._counter_samples[-1]
         cutoff = newest_at - window
-        before = [
-            sample for sample in self._counter_samples if sample[0] <= cutoff
-        ]
-        after = [
-            sample for sample in self._counter_samples if sample[0] >= cutoff
-        ]
-        if not before or not after:
+        baseline_counters = interpolate_counters(
+            self._counter_samples,
+            cutoff,
+            self.sample_interval_seconds * 1.5,
+        )
+        if baseline_counters is None:
             return CPUReading(
                 self._usage_percent,
                 None,
                 False,
                 "cpu_average_warming_up",
-            )
-        before_at, before_counters = before[-1]
-        after_at, after_counters = after[0]
-        if after_at == before_at:
-            baseline_counters = before_counters
-        else:
-            bracket = after_at - before_at
-            if bracket > self.sample_interval_seconds * 1.5:
-                return CPUReading(
-                    self._usage_percent,
-                    None,
-                    False,
-                    "cpu_average_warming_up",
-                )
-            position = (cutoff - before_at) / bracket
-            baseline_counters = (
-                before_counters[0]
-                + (after_counters[0] - before_counters[0]) * position,
-                before_counters[1]
-                + (after_counters[1] - before_counters[1]) * position,
             )
         try:
             average = self.calculate_usage(baseline_counters, newest_counters)
@@ -576,6 +674,272 @@ class CPUMonitor:
         )
 
 
+class NetworkMonitor:
+    """Muestrea RX/TX por interfaz desde /proc/net/dev."""
+
+    def __init__(
+        self,
+        sample_interval_seconds: float = 1.0,
+        retention_seconds: float = 3600.0,
+        reader=None,
+        identity_reader=None,
+        clock=None,
+    ):
+        self.sample_interval_seconds = max(0.1, float(sample_interval_seconds))
+        self.retention_seconds = min(3600.0, max(60.0, float(retention_seconds)))
+        self.reader = reader or self._read_proc_net_dev
+        self.identity_reader = (
+            identity_reader or self._read_interface_identities
+        )
+        self.clock = clock or time.monotonic
+        self._last_attempt_at = None
+        self._previous_at = None
+        self._previous_counters = {}
+        self._current_counters = {}
+        self._current_rates = {}
+        self._counter_samples = {}
+        self._interface_identities = {}
+        self._reason = "network_monitor_warming_up"
+
+    @staticmethod
+    def _read_proc_net_dev():
+        with open("/proc/net/dev", "r", encoding="ascii") as proc_net_dev:
+            return proc_net_dev.read()
+
+    @staticmethod
+    def parse_counters(raw: str) -> Dict[str, Tuple[int, int]]:
+        counters = {}
+        for line in str(raw).splitlines():
+            if ":" not in line:
+                continue
+            interface, values_raw = line.split(":", 1)
+            values = values_raw.split()
+            if len(values) < 16:
+                continue
+            counters[interface.strip()] = (int(values[0]), int(values[8]))
+        if not counters:
+            raise ValueError("/proc/net/dev no contiene interfaces")
+        return counters
+
+    @classmethod
+    def discover_interfaces(cls, sys_path=Path("/sys/class/net")):
+        interfaces = set()
+        try:
+            interfaces.update(entry.name for entry in Path(sys_path).iterdir())
+        except OSError:
+            pass
+        try:
+            interfaces.update(cls.parse_counters(cls._read_proc_net_dev()))
+        except (OSError, ValueError):
+            pass
+        return tuple(sorted(interfaces))
+
+    @staticmethod
+    def _read_interface_identities(interfaces):
+        identities = {}
+        for interface in interfaces:
+            try:
+                value = (
+                    Path("/sys/class/net") / interface / "ifindex"
+                ).read_text(encoding="ascii")
+                identities[interface] = int(value.strip())
+            except (OSError, ValueError):
+                pass
+        return identities
+
+    @staticmethod
+    def calculate_rates(
+        previous: Tuple[int, int],
+        current: Tuple[int, int],
+        elapsed_seconds: float,
+    ) -> Tuple[float, float]:
+        elapsed = float(elapsed_seconds)
+        rx_delta = current[0] - previous[0]
+        tx_delta = current[1] - previous[1]
+        if elapsed <= 0 or rx_delta < 0 or tx_delta < 0:
+            raise ValueError("contadores de red no avanzaron")
+        return rx_delta / elapsed, tx_delta / elapsed
+
+    @staticmethod
+    def select_direction(rates: Tuple[float, float], direction: str) -> float:
+        if direction == "rx":
+            return rates[0]
+        if direction == "tx":
+            return rates[1]
+        return rates[0] + rates[1]
+
+    def _reset(self, reason: str):
+        self._previous_at = None
+        self._previous_counters = {}
+        self._current_counters = {}
+        self._current_rates = {}
+        self._counter_samples = {}
+        self._interface_identities = {}
+        self._reason = reason
+
+    def record(self, raw: str, sampled_at: Optional[float] = None):
+        sampled_at = self.clock() if sampled_at is None else float(sampled_at)
+        counters = self.parse_counters(raw)
+        identities = self.identity_reader(tuple(counters))
+        previous_at = self._previous_at
+        previous = self._previous_counters
+        previous_identities = self._interface_identities
+        gap = None if previous_at is None else sampled_at - previous_at
+        if gap is None or gap > self.sample_interval_seconds * 3:
+            self._current_rates = {}
+            self._counter_samples = {
+                interface: [(sampled_at, values)]
+                for interface, values in counters.items()
+            }
+            self._reason = "network_monitor_warming_up"
+        else:
+            rates = {}
+            histories = {}
+            cutoff = sampled_at - self.retention_seconds
+            for interface, values in counters.items():
+                history = self._counter_samples.get(interface, [])
+                old_values = previous.get(interface)
+                identity_changed = (
+                    interface in previous_identities
+                    and interface in identities
+                    and previous_identities[interface] != identities[interface]
+                )
+                if identity_changed:
+                    old_values = None
+                    history = []
+                if old_values is not None:
+                    try:
+                        rates[interface] = self.calculate_rates(
+                            old_values,
+                            values,
+                            gap,
+                        )
+                    except ValueError:
+                        history = []
+                history.append((sampled_at, values))
+                recent = [sample for sample in history if sample[0] >= cutoff]
+                older = [sample for sample in history if sample[0] < cutoff]
+                histories[interface] = older[-1:] + recent
+            self._current_rates = rates
+            self._counter_samples = histories
+            self._reason = "network_sample_available"
+        self._previous_at = sampled_at
+        self._previous_counters = counters
+        self._current_counters = counters
+        self._interface_identities = identities
+        return self.status()
+
+    def sample(self, force: bool = False):
+        now = self.clock()
+        if (
+            not force
+            and self._last_attempt_at is not None
+            and now - self._last_attempt_at < self.sample_interval_seconds
+        ):
+            return self.status()
+        self._last_attempt_at = now
+        try:
+            return self.record(self.reader(), sampled_at=now)
+        except (OSError, ValueError, IndexError) as e:
+            self._reset(f"network_monitor_error: {e}")
+            return self.status()
+
+    def status(self) -> NetworkMonitorStatus:
+        return NetworkMonitorStatus(
+            reliable=bool(self._current_rates),
+            reason=self._reason,
+            interfaces=tuple(sorted(self._current_counters)),
+        )
+
+    def available_interfaces(self) -> Tuple[str, ...]:
+        interfaces = set(self._current_counters)
+        interfaces.update(self.discover_interfaces())
+        return tuple(sorted(interfaces))
+
+    def reading(
+        self,
+        interface: str,
+        direction: str,
+        average_window_seconds: int = 0,
+    ) -> NetworkReading:
+        if interface not in self._current_counters:
+            return NetworkReading(
+                None,
+                None,
+                None,
+                None,
+                False,
+                "network_interface_unavailable",
+            )
+        rates = self._current_rates.get(interface)
+        if rates is None:
+            return NetworkReading(
+                None,
+                None,
+                None,
+                None,
+                False,
+                self._reason,
+            )
+        direction = direction if direction in ("rx", "tx", "both") else "both"
+        speed = self.select_direction(rates, direction)
+        requested_window = max(0, int(average_window_seconds))
+        window = max(2, requested_window) if requested_window else 0
+        if not window:
+            return NetworkReading(
+                rates[0],
+                rates[1],
+                speed,
+                None,
+                True,
+                "network_sample_available",
+            )
+
+        history = self._counter_samples.get(interface, [])
+        newest_at, newest_counters = history[-1]
+        cutoff = newest_at - window
+        baseline = interpolate_counters(
+            history,
+            cutoff,
+            min(
+                self.sample_interval_seconds * 3,
+                max(self.sample_interval_seconds * 1.5, window),
+            ),
+        )
+        if baseline is None:
+            return NetworkReading(
+                rates[0],
+                rates[1],
+                speed,
+                None,
+                False,
+                "network_average_warming_up",
+            )
+        try:
+            average_rates = self.calculate_rates(
+                baseline,
+                newest_counters,
+                window,
+            )
+        except ValueError:
+            return NetworkReading(
+                rates[0],
+                rates[1],
+                speed,
+                None,
+                False,
+                "network_average_warming_up",
+            )
+        return NetworkReading(
+            rates[0],
+            rates[1],
+            speed,
+            self.select_direction(average_rates, direction),
+            True,
+            "network_average_available",
+        )
+
+
 class ConditionRuntimeState:
     """Estado temporal separado de la configuración persistente."""
 
@@ -583,8 +947,8 @@ class ConditionRuntimeState:
         self.activity_generation = 0
         self._idle_triggered_generation = {}
         self._idle_snooze_generation = {}
-        self._cpu_satisfied_since = {}
-        self._cpu_last_evaluated_at = {}
+        self._condition_satisfied_since = {}
+        self._condition_last_evaluated_at = {}
 
     def record_activity(self):
         self.activity_generation += 1
@@ -612,25 +976,61 @@ class ConditionRuntimeState:
         self._idle_snooze_generation.pop(schedule_id, None)
 
     def cpu_satisfied_since(self, schedule_id: str) -> Optional[datetime]:
-        return self._cpu_satisfied_since.get(schedule_id)
+        return self.condition_satisfied_since(schedule_id, "cpu")
 
     def mark_cpu_satisfied(self, schedule_id: str, now: datetime) -> datetime:
-        return self._cpu_satisfied_since.setdefault(schedule_id, now)
+        return self.mark_condition_satisfied(schedule_id, "cpu", now)
 
     def clear_cpu_satisfied(self, schedule_id: str):
-        self._cpu_satisfied_since.pop(schedule_id, None)
+        self.clear_condition_satisfied(schedule_id, "cpu")
 
     def record_cpu_evaluation(self, schedule_id: str, now: datetime) -> bool:
-        previous = self._cpu_last_evaluated_at.get(schedule_id)
-        self._cpu_last_evaluated_at[schedule_id] = now
+        return self.record_condition_evaluation(schedule_id, "cpu", now)
+
+    def clear_cpu_runtime(self, schedule_id: str):
+        self.clear_condition_runtime(schedule_id, "cpu")
+
+    def condition_satisfied_since(
+        self,
+        schedule_id: str,
+        condition_type: str,
+    ) -> Optional[datetime]:
+        return self._condition_satisfied_since.get(
+            (schedule_id, condition_type)
+        )
+
+    def mark_condition_satisfied(
+        self,
+        schedule_id: str,
+        condition_type: str,
+        now: datetime,
+    ) -> datetime:
+        return self._condition_satisfied_since.setdefault(
+            (schedule_id, condition_type),
+            now,
+        )
+
+    def clear_condition_satisfied(self, schedule_id: str, condition_type: str):
+        self._condition_satisfied_since.pop((schedule_id, condition_type), None)
+
+    def record_condition_evaluation(
+        self,
+        schedule_id: str,
+        condition_type: str,
+        now: datetime,
+    ) -> bool:
+        key = (schedule_id, condition_type)
+        previous = self._condition_last_evaluated_at.get(key)
+        self._condition_last_evaluated_at[key] = now
         if previous is None:
             return False
         gap = (now - previous).total_seconds()
         return 0 <= gap <= 5
 
-    def clear_cpu_runtime(self, schedule_id: str):
-        self.clear_cpu_satisfied(schedule_id)
-        self._cpu_last_evaluated_at.pop(schedule_id, None)
+    def clear_condition_runtime(self, schedule_id: str, condition_type: str):
+        key = (schedule_id, condition_type)
+        self.clear_condition_satisfied(schedule_id, condition_type)
+        self._condition_last_evaluated_at.pop(key, None)
 
 
 class ConditionEngine:
@@ -662,6 +1062,24 @@ class ConditionEngine:
                 use_average=getattr(schedule, "cpu_use_average", False),
                 enabled=getattr(schedule, "require_cpu", False),
             ),
+            NetworkCondition(
+                getattr(schedule, "network_interface", ""),
+                getattr(schedule, "network_direction", "both"),
+                getattr(schedule, "network_comparison", "less"),
+                float(getattr(schedule, "network_threshold", 50))
+                * (
+                    1024 * 1024
+                    if getattr(schedule, "network_unit", "KB/s") == "MB/s"
+                    else 1024
+                ),
+                getattr(schedule, "network_duration_seconds", 300),
+                use_average=getattr(
+                    schedule,
+                    "network_use_average",
+                    False,
+                ),
+                enabled=getattr(schedule, "require_network", False),
+            ),
         )
 
     def evaluate(
@@ -672,8 +1090,8 @@ class ConditionEngine:
         results = []
         for condition in self.conditions_for(schedule):
             result = condition.evaluate(context)
-            if condition.condition_type == "cpu":
-                result = self._apply_cpu_duration(
+            if condition.condition_type in ("cpu", "network"):
+                result = self._apply_continuous_duration(
                     str(getattr(schedule, "id", "")),
                     condition,
                     result,
@@ -773,37 +1191,43 @@ class ConditionEngine:
             conditions=results,
         )
 
-    def _apply_cpu_duration(
+    def _apply_continuous_duration(
         self,
         schedule_id: str,
-        condition: CPUCondition,
+        condition,
         result: ConditionResult,
         now: datetime,
     ) -> ConditionResult:
+        condition_type = condition.condition_type
         if not result.enabled:
-            self.runtime.clear_cpu_runtime(schedule_id)
+            self.runtime.clear_condition_runtime(schedule_id, condition_type)
             return result
 
-        continuous_observation = self.runtime.record_cpu_evaluation(
+        continuous_observation = self.runtime.record_condition_evaluation(
             schedule_id,
+            condition_type,
             now,
         )
         if not continuous_observation:
-            self.runtime.clear_cpu_satisfied(schedule_id)
+            self.runtime.clear_condition_satisfied(schedule_id, condition_type)
 
         if not result.satisfied:
-            self.runtime.clear_cpu_satisfied(schedule_id)
+            self.runtime.clear_condition_satisfied(schedule_id, condition_type)
             return result
 
-        satisfied_since = self.runtime.mark_cpu_satisfied(schedule_id, now)
+        satisfied_since = self.runtime.mark_condition_satisfied(
+            schedule_id,
+            condition_type,
+            now,
+        )
         elapsed = max(0.0, (now - satisfied_since).total_seconds())
         satisfied = elapsed >= condition.minimum_seconds
         info = dict(result.info)
         info["threshold_met"] = True
         if satisfied:
-            reason = "cpu_duration_reached"
+            reason = f"{condition_type}_duration_reached"
         else:
-            reason = "waiting_for_cpu_duration"
+            reason = f"waiting_for_{condition_type}_duration"
         return replace(
             result,
             satisfied=satisfied,
