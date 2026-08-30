@@ -69,6 +69,7 @@ if [[ -f "$OLD_SERVICE" ]]; then
 fi
 
 install -Dm755 "$APP_SRC/amp_autopower.py" "$APP_SHARE/amp_autopower.py"
+install -Dm644 "$APP_SRC/condition_engine.py" "$APP_SHARE/condition_engine.py"
 install -Dm644 "$APP_SRC/VERSION" "$APP_SHARE/VERSION"
 install -Dm644 "$APP_SRC/README.md" "$APP_SHARE/README.md"
 

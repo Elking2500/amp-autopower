@@ -20,6 +20,7 @@ from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from condition_engine import ConditionContext, ConditionEngine, ScheduledOccurrence
 from PySide6.QtCore import Qt, QTimer, QLockFile, QStandardPaths, QThread, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
@@ -206,6 +207,7 @@ DEFAULT_STATE = {
     "last_runs": {},
     "snoozes": {},
     "skipped_targets": {},
+    "pending_occurrences": {},
     "last_update_check": None,
     "available_update": None,
 }
@@ -760,11 +762,8 @@ class MainWindow(QMainWindow):
         self.install_poll_timer = QTimer(self)
         self.install_poll_timer.timeout.connect(self._poll_update_install)
 
-        # Cada movimiento/pulsación crea una nueva generación de actividad.
-        # Las programaciones solo-inactividad se ejecutan una vez por ciclo.
-        self.activity_generation = 0
-        self.idle_triggered_generation = {}
-        self.idle_snooze_generation = {}
+        self.condition_engine = ConditionEngine()
+        self._prune_pending_occurrences()
 
         self.last_activity_monotonic = time.monotonic()
         self.last_activity_device = "inicio de AMP AutoPower"
@@ -956,7 +955,49 @@ class MainWindow(QMainWindow):
     def set_schedules(self, schedules):
         self.config["schedules"] = [asdict(s) for s in schedules]
         save_json(CONFIG_FILE, self.config)
+
+        schedules_by_id = {s.id: s for s in schedules}
+        for dlg in list(self.active_dialogs.values()):
+            dialog_schedule = getattr(dlg, "schedule", None)
+            schedule_id = getattr(dialog_schedule, "id", None)
+            updated = schedules_by_id.get(schedule_id)
+            if schedule_id and (
+                updated is None
+                or not updated.enabled
+                or not updated.weekdays
+                or bool(updated.use_time) != bool(dialog_schedule.use_time)
+            ):
+                dlg.finish("cancel")
+
+        self._prune_pending_occurrences(schedules)
         self.refresh_list()
+
+    def _prune_pending_occurrences(self, schedules=None):
+        if schedules is None:
+            valid_ids = {
+                raw.get("id")
+                for raw in self.config.get("schedules", [])
+                if (
+                    isinstance(raw, dict)
+                    and raw.get("enabled", True)
+                    and raw.get("use_time", True)
+                    and raw.get("weekdays", [])
+                )
+            }
+        else:
+            valid_ids = {
+                s.id
+                for s in schedules
+                if s.enabled and s.use_time and s.weekdays
+            }
+
+        pending = self.state.setdefault("pending_occurrences", {})
+        removed = [sid for sid in pending if sid not in valid_ids]
+        for sid in removed:
+            pending.pop(sid, None)
+            self.state.get("snoozes", {}).pop(sid, None)
+        if removed:
+            save_json(STATE_FILE, self.state)
 
     def save_settings(self):
         self.config["start_minimized"] = self.start_min.isChecked()
@@ -994,7 +1035,7 @@ class MainWindow(QMainWindow):
     def on_input_activity(self, device_name):
         self.last_activity_monotonic = time.monotonic()
         self.last_activity_device = device_name or "dispositivo de entrada"
-        self.activity_generation += 1
+        self.condition_engine.runtime.record_activity()
 
     def on_input_status(self, status):
         self.input_monitor_status = status or {}; self.refresh_activity_label()
@@ -1004,6 +1045,62 @@ class MainWindow(QMainWindow):
 
     def input_monitor_reliable(self):
         return self.config.get("input_monitor_enabled", True) and bool(self.input_monitor_status.get("available")) and int(self.input_monitor_status.get("accessible",0)) > 0
+
+    def evaluate_conditions(self, s, now, occurrence=None, pending=False):
+        context = ConditionContext(
+            now=now,
+            occurrence=occurrence,
+            occurrence_pending=pending,
+            idle_seconds=self.idle_seconds(),
+            idle_reliable=self.input_monitor_reliable(),
+        )
+        return self.condition_engine.evaluate(s, context)
+
+    def pending_occurrence(self, s):
+        raw = self.state.get("pending_occurrences", {}).get(s.id)
+
+        if not raw:
+            return None
+
+        try:
+            return ScheduledOccurrence.from_state(s.id, raw)
+        except Exception as e:
+            log(f"Ocurrencia pendiente inválida para {s.id}: {e}")
+            self.state.get("pending_occurrences", {}).pop(s.id, None)
+            save_json(STATE_FILE, self.state)
+            return None
+
+    def pending_action_time(self, s, occurrence, now):
+        internal_due = None
+        if occurrence.next_check_at:
+            if occurrence.next_check_at <= occurrence.scheduled_target:
+                internal_due = occurrence.scheduled_target
+            else:
+                internal_due = occurrence.next_check_at + timedelta(
+                    seconds=int(s.final_countdown_seconds)
+                )
+
+        snooze_iso = self.state.get("snoozes", {}).get(s.id)
+        if snooze_iso:
+            try:
+                snooze_due = datetime.fromisoformat(snooze_iso)
+                return max(snooze_due, internal_due or snooze_due)
+            except Exception:
+                pass
+
+        if internal_due:
+            return internal_due
+
+        if occurrence.scheduled_target > now:
+            return occurrence.scheduled_target
+
+        return now + timedelta(seconds=int(s.final_countdown_seconds))
+
+    def save_pending_occurrence(self, occurrence):
+        self.state.setdefault("pending_occurrences", {})[
+            occurrence.schedule_id
+        ] = occurrence.to_state()
+        save_json(STATE_FILE, self.state)
 
     def refresh_activity_label(self):
         if not hasattr(self, "activity_label"): return
@@ -1016,7 +1113,7 @@ class MainWindow(QMainWindow):
             if denied: status += f"; {denied} sin permiso"
         self.activity_label.setText(f"<b>Estado:</b> {status}<br><b>Inactividad actual:</b> {mins} min {secs} s<br><b>Última actividad:</b> {self.last_activity_device}")
 
-    def defer_for_idle(self, s, target):
+    def defer_for_idle(self, s, occurrence, now):
         threshold = max(60, int(s.idle_minutes)*60); idle = int(self.idle_seconds())
         if self.input_monitor_reliable():
             missing = max(60, threshold-idle+2)
@@ -1024,7 +1121,11 @@ class MainWindow(QMainWindow):
         else:
             missing = 300
             reason = f"«{s.name}» requiere inactividad, pero AMP AutoPower no puede leer dispositivos de entrada. Se reintentará en 5 minutos por seguridad."
-        dt = datetime.now()+timedelta(seconds=missing); self.state.setdefault("snoozes",{})[s.id] = dt.isoformat(); save_json(STATE_FILE,self.state)
+        dt = now + timedelta(seconds=missing)
+        if now >= occurrence.scheduled_target:
+            occurrence = occurrence.mark_armed()
+        occurrence = occurrence.with_next_check(dt)
+        self.save_pending_occurrence(occurrence)
         self.notify("Esperando inactividad", f"{reason} Próxima comprobación: {dt.strftime('%H:%M')}.", True)
         if self.config.get("overlay_all_schedule_warnings", True): self.show_warning_banner("AMP AutoPower — esperando inactividad", reason, 10000)
 
@@ -1035,7 +1136,9 @@ class MainWindow(QMainWindow):
         return False
 
     def _idle_only_tick(self, s, now):
-        if now.weekday() not in s.weekdays:
+        evaluation = self.evaluate_conditions(s, now)
+
+        if not evaluation.weekday_allowed:
             return
 
         if not self.input_monitor_reliable():
@@ -1049,14 +1152,9 @@ class MainWindow(QMainWindow):
         snooze_iso = self.state.get("snoozes", {}).get(s.id)
 
         if snooze_iso:
-            snooze_generation = self.idle_snooze_generation.get(s.id)
-
-            if (
-                snooze_generation is not None
-                and snooze_generation != self.activity_generation
-            ):
+            if self.condition_engine.runtime.idle_snooze_was_invalidated(s.id):
                 self.state.get("snoozes", {}).pop(s.id, None)
-                self.idle_snooze_generation.pop(s.id, None)
+                self.condition_engine.runtime.clear_idle_snooze(s.id)
                 save_json(STATE_FILE, self.state)
                 snooze_iso = None
 
@@ -1068,30 +1166,28 @@ class MainWindow(QMainWindow):
                     return
 
                 self.state.get("snoozes", {}).pop(s.id, None)
-                self.idle_snooze_generation.pop(s.id, None)
+                self.condition_engine.runtime.clear_idle_snooze(s.id)
                 save_json(STATE_FILE, self.state)
 
             except Exception:
                 self.state.get("snoozes", {}).pop(s.id, None)
-                self.idle_snooze_generation.pop(s.id, None)
+                self.condition_engine.runtime.clear_idle_snooze(s.id)
                 save_json(STATE_FILE, self.state)
 
-        threshold = max(60, int(s.idle_minutes) * 60)
-
-        if self.idle_seconds() < threshold:
+        if not evaluation.ready:
             return
 
         # Ya se mostró/ejecutó durante este mismo ciclo de inactividad.
-        if (
-            self.idle_triggered_generation.get(s.id)
-            == self.activity_generation
-        ):
+        if self.condition_engine.runtime.idle_cycle_was_triggered(s.id):
             return
 
-        self.idle_triggered_generation[s.id] = self.activity_generation
+        self.condition_engine.runtime.mark_idle_cycle_triggered(s.id)
 
         target = now
-        key = f"idle:{s.id}:{self.activity_generation}"
+        key = (
+            f"idle:{s.id}:"
+            f"{self.condition_engine.runtime.activity_generation}"
+        )
 
         self.start_final_countdown(
             s,
@@ -1190,12 +1286,16 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         skipped_iso = self.state.get("skipped_targets", {}).get(s.id)
+        last_run_iso = self.state.get("last_runs", {}).get(s.id)
         for delta in range(0, 8):
             day = now.date() + timedelta(days=delta)
             candidate = datetime.combine(day, datetime.min.time()).replace(hour=hh, minute=mm)
             if candidate.weekday() not in s.weekdays or candidate < now:
                 continue
-            if skipped_iso == candidate.isoformat():
+            if (
+                skipped_iso == candidate.isoformat()
+                or last_run_iso == candidate.isoformat()
+            ):
                 continue
             return candidate
         return None
@@ -1214,7 +1314,11 @@ class MainWindow(QMainWindow):
                     idle_modes.append(s)
                 continue
 
-            nxt = self.next_occurrence(s, now)
+            pending = self.pending_occurrence(s)
+            if pending:
+                nxt = self.pending_action_time(s, pending, now)
+            else:
+                nxt = self.next_occurrence(s, now)
 
             if nxt:
                 candidates.append((nxt, s))
@@ -1276,6 +1380,184 @@ class MainWindow(QMainWindow):
                         pass
                     break
 
+    def _pending_occurrence_tick(self, s, occurrence, now):
+        if self._has_active_dialog_for_schedule(s.id):
+            return
+
+        completed = self.state.get("last_runs", {}).get(s.id)
+        if completed == occurrence.scheduled_target.isoformat():
+            self.state.get("pending_occurrences", {}).pop(s.id, None)
+            self.state.get("snoozes", {}).pop(s.id, None)
+            save_json(STATE_FILE, self.state)
+            return
+
+        snooze_dt = None
+        snooze_expired = False
+        snooze_iso = self.state.get("snoozes", {}).get(s.id)
+        if snooze_iso:
+            try:
+                snooze_dt = datetime.fromisoformat(snooze_iso)
+            except Exception:
+                snooze_dt = None
+
+            if snooze_dt is None or snooze_dt <= now:
+                snooze_expired = True
+                self.state.get("snoozes", {}).pop(s.id, None)
+                save_json(STATE_FILE, self.state)
+
+        if now >= occurrence.scheduled_target and not occurrence.armed:
+            occurrence = occurrence.mark_armed()
+            self.save_pending_occurrence(occurrence)
+
+        evaluation = self.evaluate_conditions(
+            s,
+            now,
+            occurrence,
+            pending=True,
+        )
+
+        if snooze_dt and snooze_dt > now:
+            snooze_countdown_start = snooze_dt - timedelta(
+                seconds=int(s.final_countdown_seconds)
+            )
+            if now < snooze_countdown_start:
+                return
+            if evaluation.ready_for_countdown:
+                remaining = (snooze_dt - now).total_seconds()
+                key = f"{occurrence.scheduled_target.isoformat()}:{s.id}"
+                self.start_final_countdown(
+                    s,
+                    occurrence.scheduled_target,
+                    int(max(1, remaining)),
+                    key,
+                )
+            elif (
+                occurrence.next_check_at is None
+                or now >= occurrence.next_check_at
+            ):
+                idle_result = evaluation.for_type("idle")
+                if (
+                    idle_result
+                    and idle_result.enabled
+                    and not idle_result.satisfied
+                ):
+                    self.defer_for_idle(s, occurrence, now)
+            return
+
+        # Si una condición se completa durante la ventana previa, todavía
+        # podemos terminar el countdown en la hora original.
+        if now < occurrence.scheduled_target:
+            if evaluation.ready_for_countdown:
+                remaining = (occurrence.scheduled_target - now).total_seconds()
+                key = f"{occurrence.scheduled_target.isoformat()}:{s.id}"
+                self.start_final_countdown(
+                    s,
+                    occurrence.scheduled_target,
+                    int(max(1, remaining)),
+                    key,
+                )
+            return
+
+        if (
+            occurrence.next_check_at
+            and now < occurrence.next_check_at
+            and not snooze_expired
+        ):
+            return
+
+        if evaluation.ready_for_countdown:
+            if occurrence.next_check_at:
+                occurrence = occurrence.with_next_check(None)
+                self.save_pending_occurrence(occurrence)
+            key = f"{occurrence.scheduled_target.isoformat()}:{s.id}"
+            self.start_final_countdown(
+                s,
+                occurrence.scheduled_target,
+                int(s.final_countdown_seconds),
+                key,
+            )
+            return
+
+        idle_result = evaluation.for_type("idle")
+        if idle_result and idle_result.enabled and not idle_result.satisfied:
+            self.defer_for_idle(s, occurrence, now)
+
+    def _timed_schedule_tick(self, s, now):
+        pending = self.pending_occurrence(s)
+        if pending:
+            self._pending_occurrence_tick(s, pending, now)
+            return
+
+        target = self.next_occurrence(
+            s,
+            now - timedelta(seconds=2),
+        )
+        if not target:
+            return
+
+        occurrence = ScheduledOccurrence.create(
+            s.id,
+            target,
+            int(s.final_countdown_seconds),
+            created_at=now,
+        )
+        remaining = (target - now).total_seconds()
+
+        for mins in s.warning_minutes:
+            if (
+                0 < remaining <= mins * 60
+                and remaining > mins * 60 - 2.5
+            ):
+                key = f"{target.date()}:{s.id}:warn:{mins}"
+
+                if key not in self.warned:
+                    self.warned.add(key)
+                    warning_title = (
+                        f"{ACTIONS.get(s.action, s.action)} programado"
+                    )
+                    warning_body = (
+                        f"La PC ejecutará "
+                        f"«{ACTIONS.get(s.action, s.action)}» "
+                        f"en {mins} minuto(s), a las "
+                        f"{target.strftime('%H:%M')}. "
+                        f"Abre {APP_NAME} para cancelar o cambiarlo."
+                    )
+                    self.notify(
+                        warning_title,
+                        warning_body,
+                        critical=mins <= 5,
+                    )
+                    if self.config.get(
+                        "overlay_all_schedule_warnings",
+                        True,
+                    ):
+                        self.show_warning_banner(
+                            warning_title,
+                            warning_body,
+                            12000 if mins <= 5 else 9000,
+                        )
+
+        if not 0 < remaining <= s.final_countdown_seconds:
+            return
+
+        key = f"{target.isoformat()}:{s.id}"
+        if key in self.active_dialogs:
+            return
+
+        evaluation = self.evaluate_conditions(s, now, occurrence)
+        if not evaluation.ready_for_countdown:
+            idle_result = evaluation.for_type("idle")
+            if idle_result and idle_result.enabled and not idle_result.satisfied:
+                self.defer_for_idle(s, occurrence, now)
+            return
+
+        self.start_final_countdown(
+            s,
+            target,
+            int(max(1, remaining)),
+            key,
+        )
+
     def scheduler_tick(self):
         now = datetime.now()
         dayprefix = now.strftime("%Y-%m-%d")
@@ -1289,78 +1571,11 @@ class MainWindow(QMainWindow):
             if not s.enabled or not s.weekdays:
                 continue
 
-            # Modo nuevo: sin hora fija, basado únicamente en inactividad.
             if not getattr(s, "use_time", True):
                 self._idle_only_tick(s, now)
                 continue
 
-            target = self.next_occurrence(
-                s,
-                now - timedelta(seconds=2),
-            )
-
-            if not target:
-                continue
-
-            remaining = (target - now).total_seconds()
-
-            for mins in s.warning_minutes:
-                if (
-                    0 < remaining <= mins * 60
-                    and remaining > mins * 60 - 2.5
-                ):
-                    key = f"{target.date()}:{s.id}:warn:{mins}"
-
-                    if key not in self.warned:
-                        self.warned.add(key)
-
-                        warning_title = (
-                            f"{ACTIONS.get(s.action, s.action)} programado"
-                        )
-
-                        warning_body = (
-                            f"La PC ejecutará "
-                            f"«{ACTIONS.get(s.action, s.action)}» "
-                            f"en {mins} minuto(s), a las "
-                            f"{target.strftime('%H:%M')}. "
-                            f"Abre {APP_NAME} para cancelar o cambiarlo."
-                        )
-
-                        self.notify(
-                            warning_title,
-                            warning_body,
-                            critical=mins <= 5,
-                        )
-
-                        if self.config.get(
-                            "overlay_all_schedule_warnings",
-                            True,
-                        ):
-                            self.show_warning_banner(
-                                warning_title,
-                                warning_body,
-                                12000 if mins <= 5 else 9000,
-                            )
-
-            if 0 < remaining <= s.final_countdown_seconds:
-                key = f"{target.isoformat()}:{s.id}"
-
-                if key not in self.active_dialogs:
-                    if getattr(s, "require_idle", False):
-                        if (
-                            not self.input_monitor_reliable()
-                            or self.idle_seconds()
-                            < int(s.idle_minutes) * 60
-                        ):
-                            self.defer_for_idle(s, target)
-                            continue
-
-                    self.start_final_countdown(
-                        s,
-                        target,
-                        int(max(1, remaining)),
-                        key,
-                    )
+            self._timed_schedule_tick(s, now)
 
         self.update_next_label()
 
@@ -1383,9 +1598,9 @@ class MainWindow(QMainWindow):
             self.mark_skipped(s, target)
             self.notify("Acción cancelada", f"«{s.name}» fue cancelada para esta ocasión.")
         elif result == "snooze10":
-            self.snooze(s, 10)
+            self.snooze(s, 10, target)
         elif result == "snooze30":
-            self.snooze(s, 30)
+            self.snooze(s, 30, target)
         else:
             self.execute_action(s, target)
 
@@ -1393,18 +1608,35 @@ class MainWindow(QMainWindow):
         self.state.setdefault("last_runs", {})[s.id] = target.isoformat() + ":skipped"
         self.state.setdefault("skipped_targets", {})[s.id] = target.isoformat()
         self.state.get("snoozes", {}).pop(s.id, None)
+        self.state.get("pending_occurrences", {}).pop(s.id, None)
         save_json(STATE_FILE, self.state)
 
-    def snooze(self, s, minutes):
-        dt = datetime.now() + timedelta(minutes=minutes)
+    def snooze(self, s, minutes, target=None):
+        now = datetime.now()
+        dt = now + timedelta(minutes=minutes)
 
         self.state.setdefault("snoozes", {})[s.id] = dt.isoformat()
 
-        if not getattr(s, "use_time", True):
+        if getattr(s, "use_time", True):
+            occurrence = self.pending_occurrence(s)
+            if occurrence is None and target is not None:
+                occurrence = ScheduledOccurrence.create(
+                    s.id,
+                    target,
+                    int(s.final_countdown_seconds),
+                    created_at=now,
+                )
+                if now >= target:
+                    occurrence = occurrence.mark_armed()
+            if occurrence is not None:
+                self.state.setdefault("pending_occurrences", {})[
+                    s.id
+                ] = occurrence.with_next_check(None).to_state()
+        else:
             # Permitir que se vuelva a mostrar al terminar el aplazamiento,
             # siempre que el usuario no haya vuelto a usar la PC.
-            self.idle_triggered_generation.pop(s.id, None)
-            self.idle_snooze_generation[s.id] = self.activity_generation
+            self.condition_engine.runtime.clear_idle_cycle_triggered(s.id)
+            self.condition_engine.runtime.mark_idle_snoozed(s.id)
 
         save_json(STATE_FILE, self.state)
 
@@ -1594,6 +1826,7 @@ class MainWindow(QMainWindow):
     def execute_action(self, s, target):
         self.state.setdefault("last_runs", {})[s.id] = target.isoformat()
         self.state.get("snoozes", {}).pop(s.id, None)
+        self.state.get("pending_occurrences", {}).pop(s.id, None)
         save_json(STATE_FILE, self.state)
 
         if s.action == "test":
@@ -1702,19 +1935,36 @@ class MainWindow(QMainWindow):
             )
 
     def cancel_next_run(self):
+        active = [
+            dlg
+            for dlg in self.active_dialogs.values()
+            if getattr(dlg, "schedule", None) is not None
+        ]
+        if active:
+            min(active, key=lambda dlg: dlg.remaining).finish("cancel")
+            return
+
         now = datetime.now()
         candidates = []
         for s in self.schedules():
             if s.enabled:
+                pending = self.pending_occurrence(s)
+                if pending:
+                    candidates.append((
+                        self.pending_action_time(s, pending, now),
+                        s,
+                        pending.scheduled_target,
+                    ))
+                    continue
                 nxt = self.next_occurrence(s, now)
                 if nxt:
-                    candidates.append((nxt, s))
+                    candidates.append((nxt, s, nxt))
         if not candidates:
             self.notify("Nada que cancelar", "No hay acciones activas próximas.")
             return
-        target, s = min(candidates, key=lambda x: x[0])
+        due, s, target = min(candidates, key=lambda x: x[0])
         self.mark_skipped(s, target)
-        self.notify("Próxima acción cancelada", f"{s.name} ({target.strftime('%d/%m %H:%M')}) no se ejecutará esta vez.")
+        self.notify("Próxima acción cancelada", f"{s.name} ({due.strftime('%d/%m %H:%M')}) no se ejecutará esta vez.")
 
     def test_warning(self):
         s = Schedule(name="Prueba de aviso", action="test", final_countdown_seconds=15)
