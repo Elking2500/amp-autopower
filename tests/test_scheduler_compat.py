@@ -31,6 +31,10 @@ class SchedulerHarness:
     _defer_for_conditions = MainWindow._defer_for_conditions
     _has_active_dialog_for_schedule = MainWindow._has_active_dialog_for_schedule
     _pending_occurrence_tick = MainWindow._pending_occurrence_tick
+    _idle_only_tick = MainWindow._idle_only_tick
+    _timed_schedule_tick = MainWindow._timed_schedule_tick
+    next_occurrence = MainWindow.next_occurrence
+    snooze = MainWindow.snooze
     set_schedules = MainWindow.set_schedules
     mark_skipped = MainWindow.mark_skipped
 
@@ -49,6 +53,7 @@ class SchedulerHarness:
             "overlay_all_schedule_warnings": False,
             "schedules": [],
         }
+        self.warned = set()
         self._idle_seconds = idle_seconds
         self._reliable = reliable
         self._cpu_reading = cpu_reading or CPUReading(
@@ -94,6 +99,7 @@ class SchedulerHarness:
         out = []
         cpu_settings = self.config.get("cpu_settings", {})
         network_settings = self.config.get("network_settings", {})
+        logic_settings = self.config.get("condition_logic_settings", {})
         for raw in self.config.get("schedules", []):
             data = dict(raw)
             preset = cpu_settings.get(data.get("id"), {})
@@ -104,6 +110,10 @@ class SchedulerHarness:
             if isinstance(network_preset, dict):
                 for key, value in network_preset.items():
                     data.setdefault(key, value)
+            data.setdefault(
+                "condition_logic",
+                logic_settings.get(data.get("id"), "AND"),
+            )
             out.append(Schedule(**data))
         return out
 
@@ -135,6 +145,7 @@ class SchedulerCompatibilityTests(unittest.TestCase):
             self.assertEqual(loaded_data[key], value)
         self.assertEqual(schedule_trigger_mode(loaded), "time")
         self.assertEqual(loaded.interval_minutes, 60)
+        self.assertEqual(loaded.condition_logic, "AND")
 
     def test_legacy_modes_serialize_without_interval_fields(self):
         timed = Schedule(id="timed", use_time=True, trigger_mode="time")
@@ -148,6 +159,10 @@ class SchedulerCompatibilityTests(unittest.TestCase):
             self.assertNotIn("cpu_threshold", serialized)
             self.assertNotIn("require_network", serialized)
             self.assertNotIn("network_threshold", serialized)
+            self.assertNotIn("condition_logic", serialized)
+
+        serialized_or = schedule_to_dict(Schedule(id="or", condition_logic="OR"))
+        self.assertNotIn("condition_logic", serialized_or)
 
     def test_disabled_cpu_preserves_custom_configuration(self):
         item = Schedule(
@@ -1538,6 +1553,200 @@ class SchedulerCompatibilityTests(unittest.TestCase):
         target = MainWindow.next_occurrence(owner, item, now)
 
         self.assertEqual(target, skipped + timedelta(days=7))
+
+    def test_condition_logic_round_trip_uses_compatibility_map(self):
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        item = Schedule(id="logic", condition_logic="OR")
+
+        with patch("amp_autopower.save_json"):
+            harness.set_schedules(
+                [item],
+                now=datetime(2026, 8, 31, 12, 0),
+            )
+
+        self.assertNotIn(
+            "condition_logic",
+            harness.config["schedules"][0],
+        )
+        self.assertEqual(
+            harness.config["condition_logic_settings"][item.id],
+            "OR",
+        )
+        self.assertEqual(harness.schedules()[0].condition_logic, "OR")
+
+        with patch("amp_autopower.save_json"):
+            harness.set_schedules(
+                [Schedule(id="logic", condition_logic="AND")],
+                now=datetime(2026, 8, 31, 12, 1),
+            )
+
+        self.assertNotIn(
+            item.id,
+            harness.config["condition_logic_settings"],
+        )
+
+    def test_timed_or_cpu_starts_countdown_before_time_window(self):
+        now = datetime(2026, 8, 31, 23, 20)
+        target = datetime(2026, 8, 31, 23, 30)
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+        }
+        item = Schedule(
+            id="timed-or",
+            time="23:30",
+            weekdays=[0],
+            warning_minutes=[],
+            final_countdown_seconds=60,
+            condition_logic="OR",
+            require_cpu=True,
+            cpu_duration_seconds=0,
+        )
+        harness = SchedulerHarness(
+            state,
+            cpu_reading=CPUReading(
+                5.0,
+                None,
+                True,
+                "cpu_sample_available",
+            ),
+        )
+
+        harness._timed_schedule_tick(item, now)
+
+        self.assertEqual(
+            harness.started,
+            [(item.id, target, 60, f"{target.isoformat()}:{item.id}")],
+        )
+
+    def test_idle_or_network_does_not_require_idle_monitor(self):
+        now = datetime(2026, 8, 31, 12, 0)
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+        }
+        item = Schedule(
+            id="idle-or",
+            use_time=False,
+            trigger_mode="idle",
+            weekdays=[0],
+            condition_logic="OR",
+            require_idle=True,
+            require_network=True,
+            network_interface="enp1s0",
+            network_duration_seconds=0,
+        )
+        harness = SchedulerHarness(
+            state,
+            reliable=False,
+            network_reading=NetworkReading(
+                20 * 1024,
+                10 * 1024,
+                30 * 1024,
+                None,
+                True,
+                "network_sample_available",
+            ),
+        )
+
+        harness._idle_only_tick(item, now)
+
+        self.assertEqual(len(harness.started), 1)
+        self.assertEqual(harness.started[0][1], now)
+
+    def test_interval_or_early_execution_remains_one_shot(self):
+        start = datetime(2026, 8, 31, 22, 30)
+        target = start + timedelta(minutes=60)
+        occurrence = ScheduledOccurrence.create_interval(
+            "interval-or",
+            start,
+            60,
+            60,
+        )
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {
+                occurrence.schedule_id: occurrence.to_state(),
+            },
+            "completed_intervals": {},
+        }
+        item = Schedule(
+            id=occurrence.schedule_id,
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=60,
+            weekdays=[],
+            action="test",
+            final_countdown_seconds=60,
+            condition_logic="OR",
+            require_cpu=True,
+            cpu_duration_seconds=0,
+        )
+        harness = SchedulerHarness(
+            state,
+            cpu_reading=CPUReading(
+                5.0,
+                None,
+                True,
+                "cpu_sample_available",
+            ),
+        )
+        harness.config["schedules"] = [schedule_to_dict(item)]
+        harness.config["condition_logic_settings"] = {item.id: "OR"}
+
+        with patch("amp_autopower.save_json"):
+            harness._pending_occurrence_tick(
+                item,
+                occurrence,
+                target - timedelta(minutes=10),
+            )
+            harness.execute_action(item, target)
+            harness._pending_occurrence_tick(item, occurrence, target)
+
+        self.assertEqual(len(harness.started), 1)
+        self.assertEqual(harness.started[0][1], target)
+        self.assertEqual(state["last_runs"][item.id], target.isoformat())
+        self.assertFalse(harness.config["schedules"][0]["enabled"])
+
+    def test_snooze_preserves_or_logic_and_original_target(self):
+        target = datetime(2026, 8, 31, 23, 30)
+        occurrence = ScheduledOccurrence.create("timed-or", target, 60)
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {
+                occurrence.schedule_id: occurrence.to_state(),
+            },
+        }
+        item = Schedule(
+            id=occurrence.schedule_id,
+            condition_logic="OR",
+            require_cpu=True,
+        )
+        harness = SchedulerHarness(state)
+        harness.config["schedules"] = [schedule_to_dict(item)]
+        harness.config["condition_logic_settings"] = {item.id: "OR"}
+
+        with patch("amp_autopower.save_json"):
+            harness.snooze(item, 10, target)
+
+        persisted = harness.pending_occurrence(item)
+        self.assertEqual(persisted.scheduled_target, target)
+        self.assertEqual(harness.schedules()[0].condition_logic, "OR")
 
 
 if __name__ == "__main__":

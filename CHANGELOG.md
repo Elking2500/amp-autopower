@@ -3,6 +3,7 @@
 ## 2.0.0-dev (en desarrollo)
 
 - Soporte en desarrollo para condiciones de actividad de red.
+- Soporte en desarrollo para combinar condiciones mediante AND/OR.
 
 ## 1.4.0-dev (en desarrollo)
 

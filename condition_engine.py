@@ -28,6 +28,20 @@ def interpolate_counters(samples, cutoff: float, maximum_bracket: float):
     )
 
 
+def normalize_condition_logic(value: str) -> str:
+    logic = str(value).upper()
+    return logic if logic in ("AND", "OR") else "AND"
+
+
+def combine_condition_results(results, logic: str) -> bool:
+    enabled = tuple(result for result in results if result.enabled)
+    if not enabled:
+        return False
+    if normalize_condition_logic(logic) == "OR":
+        return any(result.satisfied for result in enabled)
+    return all(result.satisfied for result in enabled)
+
+
 def schedule_trigger_mode(schedule) -> str:
     if isinstance(schedule, dict):
         mode = str(schedule.get("trigger_mode", "")).lower()
@@ -1107,21 +1121,14 @@ class ConditionEngine:
                 and result.condition_type not in ("time", "interval")
             )
         )
-        logic = str(getattr(schedule, "condition_logic", "AND")).upper()
-
-        if logic not in ("AND", "OR"):
-            logic = "AND"
-
-        if not non_temporal_results:
-            other_conditions_ready = True
-        elif logic == "OR":
-            other_conditions_ready = any(
-                result.satisfied for result in non_temporal_results
-            )
-        else:
-            other_conditions_ready = all(
-                result.satisfied for result in non_temporal_results
-            )
+        logic = normalize_condition_logic(
+            getattr(schedule, "condition_logic", "AND")
+        )
+        other_conditions_ready = (
+            combine_condition_results(non_temporal_results, logic)
+            if non_temporal_results
+            else True
+        )
 
         trigger_mode = schedule_trigger_mode(schedule)
         weekdays = getattr(schedule, "weekdays", ())
@@ -1154,16 +1161,31 @@ class ConditionEngine:
             )
             trigger_reached = temporal_result.satisfied
             armed = bool(occurrence and occurrence.armed) or trigger_reached
-            ready_for_countdown = (
-                weekday_allowed
-                and countdown_due
-                and other_conditions_ready
-            )
-            pending = (
-                context.occurrence_pending
-                and armed
-                and not other_conditions_ready
-            )
+            if logic == "OR":
+                alternative_ready = combine_condition_results(
+                    non_temporal_results,
+                    "OR",
+                )
+                logical_ready = combine_condition_results(results, "OR")
+                ready_for_countdown = weekday_allowed and (
+                    countdown_due or alternative_ready
+                )
+                pending = (
+                    context.occurrence_pending
+                    and armed
+                    and not logical_ready
+                )
+            else:
+                ready_for_countdown = (
+                    weekday_allowed
+                    and countdown_due
+                    and other_conditions_ready
+                )
+                pending = (
+                    context.occurrence_pending
+                    and armed
+                    and not other_conditions_ready
+                )
         else:
             scheduled_target = None
             countdown_start = None
@@ -1172,9 +1194,8 @@ class ConditionEngine:
             trigger_reached = True
             armed = False
             pending = False
-            ready_for_countdown = (
-                weekday_allowed and other_conditions_ready
-            )
+            other_conditions_ready = combine_condition_results(results, logic)
+            ready_for_countdown = weekday_allowed and other_conditions_ready
 
         return ScheduleConditionResult(
             ready=ready_for_countdown,

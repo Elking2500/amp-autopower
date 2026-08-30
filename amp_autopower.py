@@ -201,6 +201,7 @@ class Schedule:
     action: str = "poweroff"
     warning_minutes: list = field(default_factory=lambda: [30, 15, 5, 1])
     final_countdown_seconds: int = 60
+    condition_logic: str = "AND"
     require_idle: bool = False
     idle_minutes: int = 30
     require_cpu: bool = False
@@ -223,6 +224,7 @@ class Schedule:
 
 def schedule_to_dict(schedule):
     data = asdict(schedule)
+    data.pop("condition_logic", None)
     if schedule_trigger_mode(schedule) != "interval":
         data.pop("trigger_mode", None)
         data.pop("interval_minutes", None)
@@ -267,6 +269,7 @@ DEFAULT_CONFIG = {
     "notify_updates": True,
     "cpu_settings": {},
     "network_settings": {},
+    "condition_logic_settings": {},
     "schedules": [schedule_to_dict(Schedule())],
 }
 
@@ -692,6 +695,15 @@ class ScheduleEditor(QDialog):
         self.countdown.setSuffix(" s")
         self.countdown.setValue(s.final_countdown_seconds)
 
+        self.condition_logic = QComboBox()
+        self.condition_logic.addItem("Todas deben cumplirse (AND)", "AND")
+        self.condition_logic.addItem("Cualquiera puede cumplirse (OR)", "OR")
+        logic_index = self.condition_logic.findData(
+            str(getattr(s, "condition_logic", "AND")).upper()
+        )
+        self.condition_logic.setCurrentIndex(max(0, logic_index))
+        self.condition_logic_label = QLabel("Combinar condiciones:")
+
         self.require_idle = QCheckBox("Solo ejecutar cuando no haya actividad")
         self.require_idle.setChecked(
             getattr(s, "require_idle", False)
@@ -839,6 +851,7 @@ class ScheduleEditor(QDialog):
         form.addRow("Duración:", interval_row)
         form.addRow("Acción:", self.action)
         form.addRow("Cuenta regresiva final:", self.countdown)
+        form.addRow(self.condition_logic_label, self.condition_logic)
         form.addRow("Inactividad:", self.require_idle)
         form.addRow("Tiempo mínimo inactivo:", self.idle_minutes)
         form.addRow("CPU:", self.require_cpu)
@@ -923,6 +936,7 @@ class ScheduleEditor(QDialog):
         self._refresh_mode_controls()
         self._refresh_cpu_controls()
         self._refresh_network_controls()
+        self._refresh_logic_controls()
         self._refresh_action_controls()
 
     def _refresh_mode_controls(self):
@@ -943,6 +957,7 @@ class ScheduleEditor(QDialog):
         else:
             self.require_idle.setEnabled(True)
             self.idle_minutes.setEnabled(self.require_idle.isChecked())
+        self._refresh_logic_controls()
 
     def _ensure_interval_duration(self):
         if self.interval_hours.value() == 0 and self.interval_minutes.value() == 0:
@@ -957,6 +972,7 @@ class ScheduleEditor(QDialog):
         self.cpu_average.setEnabled(
             enabled and self.cpu_use_average.isChecked()
         )
+        self._refresh_logic_controls()
 
     def _refresh_network_controls(self):
         enabled = self.require_network.isChecked()
@@ -970,6 +986,22 @@ class ScheduleEditor(QDialog):
         self.network_average.setEnabled(
             enabled and self.network_use_average.isChecked()
         )
+        self._refresh_logic_controls()
+
+    def _refresh_logic_controls(self):
+        if not hasattr(self, "condition_logic"):
+            return
+        mode = self.mode.currentData()
+        active_conditions = 1
+        if mode != "idle" and self.require_idle.isChecked():
+            active_conditions += 1
+        if self.require_cpu.isChecked():
+            active_conditions += 1
+        if self.require_network.isChecked():
+            active_conditions += 1
+        visible = active_conditions >= 2
+        self.condition_logic_label.setVisible(visible)
+        self.condition_logic.setVisible(visible)
 
     def _refresh_action_controls(self):
         action = self.action.currentData()
@@ -1013,6 +1045,7 @@ class ScheduleEditor(QDialog):
             action=action,
             warning_minutes=sorted(warns, reverse=True),
             final_countdown_seconds=self.countdown.value(),
+            condition_logic=self.condition_logic.currentData(),
             require_idle=(
                 True if mode == "idle"
                 else self.require_idle.isChecked()
@@ -1254,6 +1287,7 @@ class MainWindow(QMainWindow):
         out = []
         cpu_settings = self.config.get("cpu_settings", {})
         network_settings = self.config.get("network_settings", {})
+        logic_settings = self.config.get("condition_logic_settings", {})
         for raw in self.config.get("schedules", []):
             try:
                 data = dict(raw)
@@ -1265,6 +1299,10 @@ class MainWindow(QMainWindow):
                 if isinstance(network_preset, dict):
                     for key, value in network_preset.items():
                         data.setdefault(key, value)
+                data.setdefault(
+                    "condition_logic",
+                    logic_settings.get(data.get("id"), "AND"),
+                )
                 out.append(Schedule(**data))
             except Exception as e:
                 log(f"Programación inválida ignorada: {e}")
@@ -1381,10 +1419,21 @@ class MainWindow(QMainWindow):
                 network_settings[schedule.id] = configured
             else:
                 network_settings.pop(schedule.id, None)
+        logic_settings = self.config.setdefault(
+            "condition_logic_settings",
+            {},
+        )
+        for schedule in schedules:
+            logic = str(schedule.condition_logic).upper()
+            if logic == "OR":
+                logic_settings[schedule.id] = "OR"
+            else:
+                logic_settings.pop(schedule.id, None)
         removed_ids = previous_ids - set(schedules_by_id)
         for schedule_id in removed_ids:
             cpu_settings.pop(schedule_id, None)
             network_settings.pop(schedule_id, None)
+            logic_settings.pop(schedule_id, None)
         self.config["schedules"] = [schedule_to_dict(s) for s in schedules]
         save_json(CONFIG_FILE, self.config)
 
@@ -1820,9 +1869,6 @@ class MainWindow(QMainWindow):
         if not evaluation.weekday_allowed:
             return
 
-        if not self.input_monitor_reliable():
-            return
-
         if self._has_active_dialog_for_schedule(s.id):
             return
 
@@ -2143,11 +2189,16 @@ class MainWindow(QMainWindow):
         if now < occurrence.scheduled_target:
             if evaluation.ready_for_countdown:
                 remaining = (occurrence.scheduled_target - now).total_seconds()
+                countdown_seconds = (
+                    int(max(1, remaining))
+                    if evaluation.countdown_due
+                    else int(s.final_countdown_seconds)
+                )
                 key = f"{occurrence.scheduled_target.isoformat()}:{s.id}"
                 self.start_final_countdown(
                     s,
                     occurrence.scheduled_target,
-                    int(max(1, remaining)),
+                    countdown_seconds,
                     key,
                 )
             return
@@ -2231,6 +2282,20 @@ class MainWindow(QMainWindow):
                         )
 
         evaluation = self.evaluate_conditions(s, now, occurrence)
+
+        if (
+            evaluation.ready_for_countdown
+            and not evaluation.countdown_due
+        ):
+            key = f"{target.isoformat()}:{s.id}"
+            if key not in self.active_dialogs:
+                self.start_final_countdown(
+                    s,
+                    target,
+                    int(s.final_countdown_seconds),
+                    key,
+                )
+            return
 
         if not 0 < remaining <= s.final_countdown_seconds:
             return
