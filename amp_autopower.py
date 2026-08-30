@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import configparser
 import hashlib
 import json
 import os
@@ -28,8 +29,21 @@ from condition_engine import (
     ScheduledOccurrence,
     schedule_trigger_mode,
 )
-from PySide6.QtCore import Qt, QTimer, QLockFile, QStandardPaths, QThread, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QIcon
+from compact_display import (
+    CompactDisplayWindow,
+    DisplayOptions,
+    DisplayScreen,
+    DisplaySnapshot,
+    build_display_conditions,
+    display_options_from_config,
+    format_clock,
+    format_schedule_time,
+    format_ui_datetime,
+    restore_display_position,
+    store_display_options,
+)
+from PySide6.QtCore import QLocale, Qt, QTimer, QLockFile, QStandardPaths, QThread, Signal
+from PySide6.QtGui import QAction, QColor, QCloseEvent, QIcon, QPalette
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -70,6 +84,169 @@ ACTIONS = {
 }
 
 
+def configure_qt_system_theme(environment=None):
+    environment = os.environ if environment is None else environment
+    if environment.get("QT_QPA_PLATFORMTHEME"):
+        return
+    desktop = " ".join(
+        str(environment.get(key, ""))
+        for key in (
+            "XDG_CURRENT_DESKTOP",
+            "XDG_SESSION_DESKTOP",
+            "DESKTOP_SESSION",
+            "KDE_FULL_SESSION",
+        )
+    ).lower()
+    if "kde" in desktop or "plasma" in desktop:
+        environment["QT_QPA_PLATFORMTHEME"] = "kde"
+
+
+def _read_kde_colors(environment=None, path=None):
+    environment = os.environ if environment is None else environment
+    if path is None:
+        config_home = environment.get("XDG_CONFIG_HOME")
+        if not config_home:
+            home = environment.get("HOME") or str(Path.home())
+            config_home = str(Path(home) / ".config")
+        path = Path(config_home) / "kdeglobals"
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    parser.optionxform = str
+    try:
+        with Path(path).open("r", encoding="utf-8") as handle:
+            parser.read_file(handle)
+    except (OSError, configparser.Error):
+        return {}
+    return {
+        section: dict(parser.items(section))
+        for section in parser.sections()
+        if section.startswith("Colors:")
+    }
+
+
+def _kde_color(groups, group, key):
+    raw = groups.get(group, {}).get(key)
+    if raw is None:
+        return None
+    try:
+        values = [int(part.strip()) for part in raw.split(",")[:3]]
+    except ValueError:
+        return None
+    if len(values) != 3 or any(value < 0 or value > 255 for value in values):
+        return None
+    return QColor(*values)
+
+
+def _color_luminance(color):
+    return (
+        color.redF() * 0.2126
+        + color.greenF() * 0.7152
+        + color.blueF() * 0.0722
+    )
+
+
+def palette_is_dark(palette):
+    background = palette.color(QPalette.Window)
+    foreground = palette.color(QPalette.WindowText)
+    return _color_luminance(background) < _color_luminance(foreground)
+
+
+def kde_colors_are_dark(groups):
+    background = _kde_color(
+        groups,
+        "Colors:Window",
+        "BackgroundNormal",
+    )
+    foreground = _kde_color(
+        groups,
+        "Colors:Window",
+        "ForegroundNormal",
+    )
+    if background is None or foreground is None:
+        return None
+    return _color_luminance(background) < _color_luminance(foreground)
+
+
+def _style_hint_is_dark(app):
+    try:
+        scheme = app.styleHints().colorScheme()
+    except (AttributeError, RuntimeError):
+        return None
+    if scheme == Qt.ColorScheme.Dark:
+        return True
+    if scheme == Qt.ColorScheme.Light:
+        return False
+    return None
+
+
+def _fallback_palette(base, dark, groups):
+    palette = QPalette(base)
+    defaults = {
+        "window": QColor(45, 50, 70) if dark else QColor(239, 240, 241),
+        "window_text": QColor(222, 222, 222) if dark else QColor(35, 38, 41),
+        "base": QColor(35, 40, 55) if dark else QColor(255, 255, 255),
+        "alternate": QColor(45, 50, 65) if dark else QColor(247, 247, 247),
+        "button": QColor(25, 30, 45) if dark else QColor(239, 240, 241),
+        "button_text": QColor(250, 250, 250) if dark else QColor(35, 38, 41),
+        "highlight": QColor(121, 141, 210) if dark else QColor(61, 174, 233),
+        "highlight_text": QColor(255, 255, 255),
+        "tooltip": QColor(50, 50, 50) if dark else QColor(255, 255, 220),
+        "tooltip_text": QColor(222, 222, 222) if dark else QColor(35, 38, 41),
+    }
+    values = {
+        "window": _kde_color(groups, "Colors:Window", "BackgroundNormal"),
+        "window_text": _kde_color(groups, "Colors:Window", "ForegroundNormal"),
+        "base": _kde_color(groups, "Colors:View", "BackgroundNormal"),
+        "alternate": _kde_color(groups, "Colors:View", "BackgroundAlternate"),
+        "button": _kde_color(groups, "Colors:Button", "BackgroundNormal"),
+        "button_text": _kde_color(groups, "Colors:Button", "ForegroundNormal"),
+        "highlight": _kde_color(groups, "Colors:Selection", "BackgroundNormal"),
+        "highlight_text": _kde_color(groups, "Colors:Selection", "ForegroundNormal"),
+        "tooltip": _kde_color(groups, "Colors:Tooltip", "BackgroundNormal"),
+        "tooltip_text": _kde_color(groups, "Colors:Tooltip", "ForegroundNormal"),
+    }
+    values = {
+        key: value if value is not None else defaults[key]
+        for key, value in values.items()
+    }
+    for role, key in (
+        (QPalette.Window, "window"),
+        (QPalette.WindowText, "window_text"),
+        (QPalette.Base, "base"),
+        (QPalette.AlternateBase, "alternate"),
+        (QPalette.Text, "window_text"),
+        (QPalette.Button, "button"),
+        (QPalette.ButtonText, "button_text"),
+        (QPalette.Highlight, "highlight"),
+        (QPalette.HighlightedText, "highlight_text"),
+        (QPalette.ToolTipBase, "tooltip"),
+        (QPalette.ToolTipText, "tooltip_text"),
+    ):
+        palette.setColor(role, values[key])
+    return palette
+
+
+def apply_system_palette_fallback(
+    app,
+    environment=None,
+    kde_colors=None,
+):
+    groups = (
+        _read_kde_colors(environment)
+        if kde_colors is None
+        else kde_colors
+    )
+    kde_dark = kde_colors_are_dark(groups)
+    palette = app.palette()
+    palette_dark = palette_is_dark(palette)
+    desired_dark = kde_dark
+    if desired_dark is None:
+        desired_dark = _style_hint_is_dark(app)
+    if desired_dark is None or desired_dark == palette_dark:
+        return False
+    app.setPalette(_fallback_palette(palette, desired_dark, groups))
+    return True
+
+
 def format_interval(minutes):
     hours, remaining = divmod(max(1, int(minutes)), 60)
     parts = []
@@ -78,6 +255,34 @@ def format_interval(minutes):
     if remaining:
         parts.append(f"{remaining} min")
     return " ".join(parts)
+
+
+def use_24_hour_format(config):
+    return bool(config.get("display_use_24_hour", True))
+
+
+def format_app_time(config, value, include_seconds=False):
+    if isinstance(value, str):
+        return format_schedule_time(value, use_24_hour_format(config))
+    return format_clock(
+        value,
+        use_24_hour_format(config),
+        include_seconds,
+    )
+
+
+def format_app_datetime(
+    config,
+    value,
+    date_format="%a %d/%m",
+    include_seconds=False,
+):
+    return format_ui_datetime(
+        value,
+        use_24_hour_format(config),
+        date_format,
+        include_seconds,
+    )
 
 
 def ensure_dirs():
@@ -270,6 +475,13 @@ DEFAULT_CONFIG = {
     "cpu_settings": {},
     "network_settings": {},
     "condition_logic_settings": {},
+    "display_enabled": False,
+    "display_always_on_top": True,
+    "display_show_title": True,
+    "display_show_action": True,
+    "display_transparency_percent": 25,
+    "display_use_24_hour": True,
+    "display_position": {},
     "schedules": [schedule_to_dict(Schedule())],
 }
 
@@ -556,7 +768,7 @@ class WarningBanner(QWidget):
 
 class OverlayPage(QWidget):
     action_requested = Signal(str)
-    def __init__(self, screen, schedule, remaining):
+    def __init__(self, screen, schedule, remaining, use_24_hour=True):
         super().__init__(None, _overlay_flags())
         self.screen = screen; self.schedule = schedule
         self.setWindowTitle("AMP AutoPower — EMERGENCIA")
@@ -570,7 +782,10 @@ class OverlayPage(QWidget):
         lay.addWidget(self.title)
         mode = schedule_trigger_mode(schedule)
         if mode == "time":
-            trigger_text = f"Hora programada: <b>{schedule.time}</b>"
+            trigger_text = (
+                "Hora programada: "
+                f"<b>{format_schedule_time(schedule.time, use_24_hour)}</b>"
+            )
         elif mode == "interval":
             trigger_text = (
                 f"Intervalo: <b>{format_interval(schedule.interval_minutes)}</b>"
@@ -607,10 +822,11 @@ class CountdownDialog(QDialog):
     def _make_pages(self):
         if self.pages: return
         parent = self.parent(); all_screens = bool(getattr(parent,"config",{}).get("overlay_all_screens",True))
+        use_24_hour = use_24_hour_format(getattr(parent, "config", {}))
         screens = QApplication.screens() if all_screens else [QApplication.primaryScreen()]
         for screen in screens:
             if screen is None: continue
-            page = OverlayPage(screen,self.schedule,self.remaining); page.action_requested.connect(self.finish); page.setGeometry(screen.geometry()); self.pages.append(page)
+            page = OverlayPage(screen,self.schedule,self.remaining,use_24_hour); page.action_requested.connect(self.finish); page.setGeometry(screen.geometry()); self.pages.append(page)
     def show(self):
         self._make_pages()
         for page in self.pages:
@@ -637,7 +853,7 @@ class CountdownDialog(QDialog):
 
 
 class ScheduleEditor(QDialog):
-    def __init__(self, parent=None, schedule=None):
+    def __init__(self, parent=None, schedule=None, use_24_hour=None):
         super().__init__(parent)
         self.setWindowTitle("Editar programación")
         self.resize(610, 680)
@@ -666,7 +882,12 @@ class ScheduleEditor(QDialog):
         self.mode.setCurrentIndex(max(0, mode_index))
 
         self.time = QTimeEdit(QTime.fromString(s.time, "HH:mm"))
-        self.time.setDisplayFormat("HH:mm")
+        if use_24_hour is None:
+            parent_config = getattr(parent, "config", {})
+            use_24_hour = parent_config.get("display_use_24_hour", True)
+        if not use_24_hour:
+            self.time.setLocale(QLocale(QLocale.English, QLocale.UnitedStates))
+        self.time.setDisplayFormat("HH:mm" if use_24_hour else "h:mm AP")
 
         interval_minutes = max(1, int(getattr(s, "interval_minutes", 60)))
         interval_hours, interval_remainder = divmod(interval_minutes, 60)
@@ -1127,6 +1348,12 @@ class MainWindow(QMainWindow):
             self.tray.setContextMenu(menu)
         show_action = QAction("Abrir", self)
         show_action.triggered.connect(self.show_normal)
+        self.display_tray_action = QAction("Mostrar display", self)
+        self.display_tray_action.setCheckable(True)
+        self.display_tray_action.setChecked(
+            self.config.get("display_enabled", False)
+        )
+        self.display_tray_action.toggled.connect(self.set_display_enabled)
         cancel_action = QAction("Cancelar próxima ejecución", self)
         cancel_action.triggered.connect(self.cancel_next_run)
         update_action = QAction("Buscar actualizaciones", self)
@@ -1134,6 +1361,7 @@ class MainWindow(QMainWindow):
         quit_action = QAction("Salir", self)
         quit_action.triggered.connect(self.quit_app)
         menu.addAction(show_action)
+        menu.addAction(self.display_tray_action)
         menu.addAction(cancel_action)
         menu.addAction(update_action)
         menu.addSeparator()
@@ -1194,6 +1422,48 @@ class MainWindow(QMainWindow):
         for w in (self.fullscreen_overlay, self.overlay_all_screens, self.overlay_all_schedule_warnings):
             overlay_lay.addWidget(w); w.toggled.connect(self.save_settings)
         settings_layout.addWidget(overlay_box)
+
+        display_box = QGroupBox("Display compacto")
+        display_lay = QFormLayout(display_box)
+        self.display_enabled = QCheckBox("Mostrar display")
+        self.display_always_on_top = QCheckBox(
+            "Siempre visible sobre otras ventanas"
+        )
+        self.display_show_title = QCheckBox("Mostrar título")
+        self.display_show_action = QCheckBox("Mostrar tipo de acción")
+        self.display_use_24_hour = QCheckBox("Usar formato de 24 horas")
+        self.display_transparency = QSpinBox()
+        self.display_transparency.setRange(1, 99)
+        self.display_transparency.setSuffix(" %")
+        display_options = display_options_from_config(self.config)
+        self.display_enabled.setChecked(display_options.enabled)
+        self.display_always_on_top.setChecked(
+            display_options.always_on_top
+        )
+        self.display_show_title.setChecked(display_options.show_title)
+        self.display_show_action.setChecked(display_options.show_action)
+        self.display_use_24_hour.setChecked(display_options.use_24_hour)
+        self.display_transparency.setValue(
+            display_options.transparency_percent
+        )
+        display_lay.addRow(self.display_enabled)
+        display_lay.addRow(self.display_always_on_top)
+        display_lay.addRow(self.display_show_title)
+        display_lay.addRow(self.display_show_action)
+        display_lay.addRow("Transparencia:", self.display_transparency)
+        display_lay.addRow(self.display_use_24_hour)
+        settings_layout.addWidget(display_box)
+        self.display_enabled.toggled.connect(self.set_display_enabled)
+        for widget in (
+            self.display_always_on_top,
+            self.display_show_title,
+            self.display_show_action,
+            self.display_use_24_hour,
+        ):
+            widget.toggled.connect(self.save_display_settings)
+        self.display_transparency.valueChanged.connect(
+            self.save_display_settings
+        )
 
         activity_box = QGroupBox("Detección global de inactividad")
         activity_lay = QVBoxLayout(activity_box)
@@ -1272,6 +1542,19 @@ class MainWindow(QMainWindow):
 
         self.refresh_list()
         self.refresh_update_ui()
+        self.compact_display = CompactDisplayWindow()
+        self.compact_display.open_requested.connect(self.show_normal)
+        self.compact_display.hide_requested.connect(
+            lambda: self.set_display_enabled(False)
+        )
+        self.compact_display.position_changed.connect(
+            self.save_display_position
+        )
+        self.compact_display.apply_options(display_options)
+        self.app.screenAdded.connect(lambda _screen: self.ensure_display_position())
+        self.app.screenRemoved.connect(lambda _screen: self.ensure_display_position())
+        if display_options.enabled:
+            self.show_compact_display()
         self._start_input_monitor()
         self.activity_ui_timer = QTimer(self)
         self.activity_ui_timer.timeout.connect(self.refresh_activity_label)
@@ -1588,6 +1871,107 @@ class MainWindow(QMainWindow):
             self.config["update_manifest_url"] = self.manifest_url.text().strip()
         save_json(CONFIG_FILE, self.config)
 
+    def current_display_options(self):
+        if not hasattr(self, "display_enabled"):
+            return display_options_from_config(self.config)
+        return DisplayOptions(
+            enabled=self.display_enabled.isChecked(),
+            always_on_top=self.display_always_on_top.isChecked(),
+            show_title=self.display_show_title.isChecked(),
+            show_action=self.display_show_action.isChecked(),
+            transparency_percent=self.display_transparency.value(),
+            use_24_hour=self.display_use_24_hour.isChecked(),
+        )
+
+    def save_display_settings(self, *_args):
+        previous_use_24_hour = use_24_hour_format(self.config)
+        options = self.current_display_options()
+        store_display_options(self.config, options)
+        if hasattr(self, "compact_display"):
+            self.compact_display.apply_options(options)
+        if (
+            previous_use_24_hour != options.use_24_hour
+            and hasattr(self, "list")
+        ):
+            self.refresh_list()
+            self.refresh_compact_display(datetime.now())
+        save_json(CONFIG_FILE, self.config)
+
+    def set_display_enabled(self, enabled):
+        enabled = bool(enabled)
+        for control_name in ("display_enabled", "display_tray_action"):
+            control = getattr(self, control_name, None)
+            if control is not None and control.isChecked() != enabled:
+                control.blockSignals(True)
+                control.setChecked(enabled)
+                control.blockSignals(False)
+        options = self.current_display_options()
+        options = DisplayOptions(
+            enabled=enabled,
+            always_on_top=options.always_on_top,
+            show_title=options.show_title,
+            show_action=options.show_action,
+            transparency_percent=options.transparency_percent,
+            use_24_hour=options.use_24_hour,
+        )
+        store_display_options(self.config, options)
+        if hasattr(self, "compact_display"):
+            self.compact_display.apply_options(options)
+            if enabled:
+                self.show_compact_display()
+            else:
+                self.compact_display.hide()
+        save_json(CONFIG_FILE, self.config)
+
+    def display_screens(self):
+        screens = []
+        for screen in QApplication.screens():
+            geometry = screen.availableGeometry()
+            screens.append(
+                DisplayScreen(
+                    screen.name(),
+                    geometry.x(),
+                    geometry.y(),
+                    geometry.width(),
+                    geometry.height(),
+                )
+            )
+        return screens
+
+    def ensure_display_position(self):
+        if not hasattr(self, "compact_display"):
+            return
+        x, y, screen_name = restore_display_position(
+            self.config.get("display_position"),
+            self.display_screens(),
+        )
+        self.compact_display.move(x, y)
+        position = {
+            "x": x,
+            "y": y,
+            "screen": screen_name,
+        }
+        if self.config.get("display_position") != position:
+            self.config["display_position"] = position
+            save_json(CONFIG_FILE, self.config)
+
+    def show_compact_display(self):
+        self.ensure_display_position()
+        self.compact_display.show()
+
+    def save_display_position(self, position):
+        if not isinstance(position, dict):
+            return
+        normalized = {
+            "x": int(position.get("x", 0)),
+            "y": int(position.get("y", 0)),
+            "screen": str(position.get("screen", "")),
+        }
+        if self.config.get("display_position") == normalized:
+            return
+        self.config["display_position"] = normalized
+        save_json(CONFIG_FILE, self.config)
+
     # ---------------- Actividad global ----------------
     def _start_input_monitor(self):
         if not self.config.get("input_monitor_enabled", True): return
@@ -1838,7 +2222,8 @@ class MainWindow(QMainWindow):
             self._condition_wait_notified = notified
             self.notify(
                 "Esperando condiciones",
-                f"{reason} Próxima comprobación: {dt.strftime('%H:%M:%S')}.",
+                f"{reason} Próxima comprobación: "
+                f"{format_app_time(self.config, dt, True)}.",
                 True,
             )
             if self.config.get("overlay_all_schedule_warnings", True):
@@ -1951,7 +2336,7 @@ class MainWindow(QMainWindow):
             status = "✓" if s.enabled else "✗"
 
             if mode == "time":
-                trigger = s.time
+                trigger = format_app_time(self.config, s.time)
             elif mode == "interval":
                 trigger = f"Intervalo {format_interval(s.interval_minutes)}"
             else:
@@ -2079,7 +2464,7 @@ class MainWindow(QMainWindow):
             parts.append(
                 f"Próxima acción: "
                 f"<b>{ACTIONS.get(s.action, s.action)}</b> — "
-                f"<b>{nxt.strftime('%a %d/%m %H:%M')}</b> — "
+                f"<b>{format_app_datetime(self.config, nxt)}</b> — "
                 f"faltan {h} h {m} min"
             )
 
@@ -2263,7 +2648,7 @@ class MainWindow(QMainWindow):
                         f"La PC ejecutará "
                         f"«{ACTIONS.get(s.action, s.action)}» "
                         f"en {mins} minuto(s), a las "
-                        f"{target.strftime('%H:%M')}. "
+                        f"{format_app_time(self.config, target)}. "
                         f"Abre {APP_NAME} para cancelar o cambiarlo."
                     )
                     self.notify(
@@ -2313,6 +2698,174 @@ class MainWindow(QMainWindow):
             target,
             int(max(1, remaining)),
             key,
+        )
+
+    def _display_snapshot(
+        self,
+        schedule,
+        now,
+        occurrence,
+        priority,
+        due=None,
+        pending=False,
+    ):
+        mode = schedule_trigger_mode(schedule)
+        target = occurrence.scheduled_target if occurrence else None
+        cpu_value = None
+        cpu_reliable = False
+        if schedule.require_cpu:
+            average_window = (
+                int(schedule.cpu_average_seconds)
+                if schedule.cpu_use_average
+                else 0
+            )
+            reading = self.cpu_monitor.reading(average_window)
+            cpu_value = (
+                reading.average_percent
+                if schedule.cpu_use_average
+                else reading.usage_percent
+            )
+            cpu_reliable = reading.reliable and cpu_value is not None
+
+        network_value = None
+        network_reliable = False
+        if schedule.require_network:
+            average_window = (
+                int(schedule.network_average_seconds)
+                if schedule.network_use_average
+                else 0
+            )
+            reading = self.network_monitor.reading(
+                schedule.network_interface,
+                schedule.network_direction,
+                average_window,
+            )
+            network_value = (
+                reading.average_bytes_per_second
+                if schedule.network_use_average
+                else reading.speed_bytes_per_second
+            )
+            network_reliable = reading.reliable and network_value is not None
+
+        options = self.current_display_options()
+        conditions = build_display_conditions(
+            mode=mode,
+            scheduled_target=target,
+            now=now,
+            use_24_hour=options.use_24_hour,
+            pending=pending,
+            idle_enabled=(mode != "idle" and schedule.require_idle),
+            idle_seconds=self.idle_seconds(),
+            idle_reliable=self.input_monitor_reliable(),
+            cpu_enabled=schedule.require_cpu,
+            cpu_value=cpu_value,
+            cpu_reliable=cpu_reliable,
+            network_enabled=schedule.require_network,
+            network_value=network_value,
+            network_reliable=network_reliable,
+        )
+        return DisplaySnapshot(
+            schedule_id=schedule.id,
+            title=schedule.name,
+            action=ACTIONS.get(schedule.action, schedule.action),
+            logic=schedule.condition_logic,
+            conditions=conditions,
+            priority=priority,
+            due=due,
+        )
+
+    def display_snapshots(self, now, schedules=None):
+        schedules = schedules if schedules is not None else self.schedules()
+        enabled_by_id = {schedule.id: schedule for schedule in schedules if schedule.enabled}
+        snapshots = []
+        active_ids = set()
+        for dialog in self.active_dialogs.values():
+            schedule = getattr(dialog, "schedule", None)
+            target = getattr(dialog, "scheduled_target", None)
+            if schedule is None or target is None:
+                continue
+            active_ids.add(schedule.id)
+            occurrence = self.pending_occurrence(schedule)
+            if occurrence is None:
+                occurrence = ScheduledOccurrence.create(
+                    schedule.id,
+                    target,
+                    int(schedule.final_countdown_seconds),
+                    created_at=now,
+                )
+            snapshots.append(
+                self._display_snapshot(
+                    schedule,
+                    now,
+                    occurrence,
+                    0,
+                    due=now + timedelta(seconds=max(0, dialog.remaining)),
+                    pending=now >= occurrence.scheduled_target,
+                )
+            )
+
+        for schedule in enabled_by_id.values():
+            if schedule.id in active_ids:
+                continue
+            mode = schedule_trigger_mode(schedule)
+            if mode != "interval" and not schedule.weekdays:
+                continue
+            occurrence = self.pending_occurrence(schedule)
+            if occurrence is not None:
+                waiting = (
+                    mode != "interval"
+                    or occurrence.armed
+                    or occurrence.next_check_at is not None
+                    or now >= occurrence.scheduled_target
+                    or schedule.id in self.state.get("snoozes", {})
+                )
+                priority = 1 if waiting else 3
+                due = (
+                    self.pending_action_time(schedule, occurrence, now)
+                    if waiting
+                    else occurrence.scheduled_target
+                )
+                snapshots.append(
+                    self._display_snapshot(
+                        schedule,
+                        now,
+                        occurrence,
+                        priority,
+                        due=due,
+                        pending=waiting and now >= occurrence.scheduled_target,
+                    )
+                )
+                continue
+            if mode == "time":
+                target = self.next_occurrence(schedule, now)
+                if target is None:
+                    continue
+                occurrence = ScheduledOccurrence.create(
+                    schedule.id,
+                    target,
+                    int(schedule.final_countdown_seconds),
+                    created_at=now,
+                )
+                snapshots.append(
+                    self._display_snapshot(
+                        schedule,
+                        now,
+                        occurrence,
+                        2,
+                        due=target,
+                    )
+                )
+                continue
+            snapshots.append(
+                self._display_snapshot(schedule, now, None, 4)
+            )
+        return snapshots
+
+    def refresh_compact_display(self, now, schedules=None):
+        if not hasattr(self, "compact_display"):
+            return
+        self.compact_display.set_snapshots(
+            self.display_snapshots(now, schedules)
         )
 
     def scheduler_tick(self):
@@ -2374,6 +2927,7 @@ class MainWindow(QMainWindow):
             self._timed_schedule_tick(s, now)
 
         self.update_next_label()
+        self.refresh_compact_display(now, schedules)
 
     def start_final_countdown(self, s, target, seconds, key):
         self.notify(
@@ -2382,6 +2936,7 @@ class MainWindow(QMainWindow):
             critical=True,
         )
         dlg = CountdownDialog(self, s, seconds)
+        dlg.scheduled_target = target
         self.active_dialogs[key] = dlg
         dlg.finished.connect(lambda _=None, k=key, d=dlg, sc=s, tg=target: self.on_countdown_finished(k, d, sc, tg))
         # El overlay independiente debe aparecer sobre el juego; no elevamos la ventana principal.
@@ -2481,7 +3036,8 @@ class MainWindow(QMainWindow):
 
         self.notify(
             "Acción pospuesta",
-            f"«{s.name}» se ejecutará a las {dt.strftime('%H:%M')}, "
+            f"«{s.name}» se ejecutará a las "
+            f"{format_app_time(self.config, dt)}, "
             f"en {minutes} minutos.",
         )
 
@@ -2872,7 +3428,12 @@ class MainWindow(QMainWindow):
             return
         due, s, target = min(candidates, key=lambda x: x[0])
         self.mark_skipped(s, target)
-        self.notify("Próxima acción cancelada", f"{s.name} ({due.strftime('%d/%m %H:%M')}) no se ejecutará esta vez.")
+        self.notify(
+            "Próxima acción cancelada",
+            f"{s.name} "
+            f"({format_app_datetime(self.config, due, '%d/%m')}) "
+            "no se ejecutará esta vez.",
+        )
 
     def test_warning(self):
         s = Schedule(name="Prueba de aviso", action="test", final_countdown_seconds=15)
@@ -2885,7 +3446,10 @@ class MainWindow(QMainWindow):
         if last:
             try:
                 dt = datetime.fromisoformat(last)
-                self.last_check_label.setText(f"Última comprobación: {dt.strftime('%d/%m/%Y %H:%M')}")
+                self.last_check_label.setText(
+                    "Última comprobación: "
+                    f"{format_app_datetime(self.config, dt, '%d/%m/%Y')}"
+                )
             except Exception:
                 self.last_check_label.setText("Última comprobación: desconocida")
         else:
@@ -3085,6 +3649,8 @@ class MainWindow(QMainWindow):
 
                 if (
                     (parent / "amp_autopower.py").exists()
+                    and (parent / "condition_engine.py").exists()
+                    and (parent / "compact_display.py").exists()
                     and (parent / "VERSION").exists()
                 ):
                     installers.append(installer)
@@ -3258,6 +3824,8 @@ class MainWindow(QMainWindow):
     def quit_app(self):
         self.config["start_minimized"] = self.start_min.isChecked()
         save_json(CONFIG_FILE, self.config)
+        if hasattr(self, "compact_display"):
+            self.compact_display.hide()
         if self.input_monitor and self.input_monitor.isRunning():
             self.input_monitor.requestInterruption(); self.input_monitor.wait(1200)
         self.tray.hide()
@@ -3305,7 +3873,9 @@ def main():
         print(APP_VERSION)
         return 0
 
+    configure_qt_system_theme()
     app = QApplication(sys.argv)
+    app._system_palette_fallback = apply_system_palette_fallback(app)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName("Local")
     app.setQuitOnLastWindowClosed(False)
