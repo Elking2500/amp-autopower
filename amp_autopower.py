@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from condition_engine import (
+    CPUMonitor,
     ConditionContext,
     ConditionEngine,
     ScheduledOccurrence,
@@ -33,7 +34,7 @@ from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QPushButton, QProgressDialog, QSpinBox, QSystemTrayIcon, QTabWidget,
+    QPushButton, QProgressDialog, QScrollArea, QSpinBox, QSystemTrayIcon, QTabWidget,
     QTimeEdit, QVBoxLayout, QWidget,
 )
 from PySide6.QtCore import QTime
@@ -201,6 +202,12 @@ class Schedule:
     final_countdown_seconds: int = 60
     require_idle: bool = False
     idle_minutes: int = 30
+    require_cpu: bool = False
+    cpu_comparison: str = "less"
+    cpu_threshold: int = 10
+    cpu_duration_seconds: int = 300
+    cpu_use_average: bool = False
+    cpu_average_seconds: int = 60
     close_apps_first: bool = True
 
 
@@ -209,6 +216,16 @@ def schedule_to_dict(schedule):
     if schedule_trigger_mode(schedule) != "interval":
         data.pop("trigger_mode", None)
         data.pop("interval_minutes", None)
+    if not schedule.require_cpu:
+        for key in (
+            "require_cpu",
+            "cpu_comparison",
+            "cpu_threshold",
+            "cpu_duration_seconds",
+            "cpu_use_average",
+            "cpu_average_seconds",
+        ):
+            data.pop(key, None)
     return data
 
 
@@ -225,6 +242,7 @@ DEFAULT_CONFIG = {
     "update_interval_hours": 48,
     "update_manifest_url": CANONICAL_UPDATE_MANIFEST_URL,
     "notify_updates": True,
+    "cpu_settings": {},
     "schedules": [schedule_to_dict(Schedule())],
 }
 
@@ -595,11 +613,17 @@ class ScheduleEditor(QDialog):
     def __init__(self, parent=None, schedule=None):
         super().__init__(parent)
         self.setWindowTitle("Editar programación")
-        self.resize(610, 630)
+        self.resize(610, 680)
         self.original = schedule
         s = schedule or Schedule()
 
-        root = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        root = QVBoxLayout(content)
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
         form = QFormLayout()
 
         self.name = QLineEdit(s.name)
@@ -657,6 +681,43 @@ class ScheduleEditor(QDialog):
             max(1, int(getattr(s, "idle_minutes", 30)))
         )
 
+        self.require_cpu = QCheckBox("Usar condición CPU")
+        self.require_cpu.setChecked(getattr(s, "require_cpu", False))
+
+        self.cpu_comparison = QComboBox()
+        self.cpu_comparison.addItem("Menor que", "less")
+        self.cpu_comparison.addItem("Mayor que", "greater")
+        cpu_comparison_index = self.cpu_comparison.findData(
+            getattr(s, "cpu_comparison", "less")
+        )
+        self.cpu_comparison.setCurrentIndex(max(0, cpu_comparison_index))
+
+        self.cpu_threshold = QSpinBox()
+        self.cpu_threshold.setRange(0, 100)
+        self.cpu_threshold.setSuffix(" %")
+        self.cpu_threshold.setValue(
+            min(100, max(0, int(getattr(s, "cpu_threshold", 10))))
+        )
+
+        self.cpu_duration = QSpinBox()
+        self.cpu_duration.setRange(1, 86400)
+        self.cpu_duration.setSuffix(" s")
+        self.cpu_duration.setValue(
+            max(1, int(getattr(s, "cpu_duration_seconds", 300)))
+        )
+
+        self.cpu_use_average = QCheckBox("Usar promedio móvil")
+        self.cpu_use_average.setChecked(
+            getattr(s, "cpu_use_average", False)
+        )
+
+        self.cpu_average = QSpinBox()
+        self.cpu_average.setRange(1, 3600)
+        self.cpu_average.setSuffix(" s")
+        self.cpu_average.setValue(
+            max(1, int(getattr(s, "cpu_average_seconds", 60)))
+        )
+
         self.close_apps = QCheckBox(
             "Cerrar aplicaciones correctamente antes de apagar/reiniciar"
         )
@@ -673,6 +734,12 @@ class ScheduleEditor(QDialog):
         form.addRow("Cuenta regresiva final:", self.countdown)
         form.addRow("Inactividad:", self.require_idle)
         form.addRow("Tiempo mínimo inactivo:", self.idle_minutes)
+        form.addRow("CPU:", self.require_cpu)
+        form.addRow("Comparación CPU:", self.cpu_comparison)
+        form.addRow("Umbral CPU:", self.cpu_threshold)
+        form.addRow("Duración continua CPU:", self.cpu_duration)
+        form.addRow("Promedio CPU:", self.cpu_use_average)
+        form.addRow("Ventana del promedio:", self.cpu_average)
         form.addRow("Cierre seguro:", self.close_apps)
 
         root.addLayout(form)
@@ -730,9 +797,12 @@ class ScheduleEditor(QDialog):
 
         self.mode.currentIndexChanged.connect(self._refresh_mode_controls)
         self.require_idle.toggled.connect(self._refresh_mode_controls)
+        self.require_cpu.toggled.connect(self._refresh_cpu_controls)
+        self.cpu_use_average.toggled.connect(self._refresh_cpu_controls)
         self.action.currentIndexChanged.connect(self._refresh_action_controls)
 
         self._refresh_mode_controls()
+        self._refresh_cpu_controls()
         self._refresh_action_controls()
 
     def _refresh_mode_controls(self):
@@ -757,6 +827,16 @@ class ScheduleEditor(QDialog):
     def _ensure_interval_duration(self):
         if self.interval_hours.value() == 0 and self.interval_minutes.value() == 0:
             self.interval_minutes.setValue(1)
+
+    def _refresh_cpu_controls(self):
+        enabled = self.require_cpu.isChecked()
+        self.cpu_comparison.setEnabled(enabled)
+        self.cpu_threshold.setEnabled(enabled)
+        self.cpu_duration.setEnabled(enabled)
+        self.cpu_use_average.setEnabled(enabled)
+        self.cpu_average.setEnabled(
+            enabled and self.cpu_use_average.isChecked()
+        )
 
     def _refresh_action_controls(self):
         action = self.action.currentData()
@@ -805,6 +885,12 @@ class ScheduleEditor(QDialog):
                 else self.require_idle.isChecked()
             ),
             idle_minutes=self.idle_minutes.value(),
+            require_cpu=self.require_cpu.isChecked(),
+            cpu_comparison=self.cpu_comparison.currentData(),
+            cpu_threshold=self.cpu_threshold.value(),
+            cpu_duration_seconds=self.cpu_duration.value(),
+            cpu_use_average=self.cpu_use_average.isChecked(),
+            cpu_average_seconds=self.cpu_average.value(),
             close_apps_first=(
                 self.close_apps.isChecked()
                 if action in ("poweroff", "reboot")
@@ -834,6 +920,9 @@ class MainWindow(QMainWindow):
         self.install_poll_timer.timeout.connect(self._poll_update_install)
 
         self.condition_engine = ConditionEngine()
+        self.cpu_monitor = CPUMonitor()
+        self._last_cpu_monitor_error = None
+        self._condition_wait_notified = {}
         self._reconcile_schedule_occurrences(
             self.schedules(),
             now=datetime.now(),
@@ -1019,17 +1108,46 @@ class MainWindow(QMainWindow):
 
     def schedules(self):
         out = []
+        cpu_settings = self.config.get("cpu_settings", {})
         for raw in self.config.get("schedules", []):
             try:
-                out.append(Schedule(**raw))
+                data = dict(raw)
+                preset = cpu_settings.get(data.get("id"), {})
+                if isinstance(preset, dict):
+                    for key, value in preset.items():
+                        data.setdefault(key, value)
+                out.append(Schedule(**data))
             except Exception as e:
                 log(f"Programación inválida ignorada: {e}")
         return out
 
     def set_schedules(self, schedules, restart_interval_ids=None, now=None):
-        previous_ids = {s.id for s in self.schedules()}
+        previous_by_id = {s.id: s for s in self.schedules()}
+        previous_ids = set(previous_by_id)
         restart_ids = set(restart_interval_ids or ())
         schedules_by_id = {s.id: s for s in schedules}
+        cpu_fields = (
+            "enabled",
+            "use_time",
+            "trigger_mode",
+            "weekdays",
+            "require_cpu",
+            "cpu_comparison",
+            "cpu_threshold",
+            "cpu_duration_seconds",
+            "cpu_use_average",
+            "cpu_average_seconds",
+        )
+        reset_cpu_ids = set(restart_ids) | (previous_ids - set(schedules_by_id))
+        for schedule_id, schedule in schedules_by_id.items():
+            previous = previous_by_id.get(schedule_id)
+            if previous is None or any(
+                getattr(previous, field_name) != getattr(schedule, field_name)
+                for field_name in cpu_fields
+            ):
+                reset_cpu_ids.add(schedule_id)
+        for schedule_id in reset_cpu_ids:
+            self.condition_engine.runtime.clear_cpu_runtime(schedule_id)
         for dlg in list(self.active_dialogs.values()):
             dialog_schedule = getattr(dlg, "schedule", None)
             schedule_id = getattr(dialog_schedule, "id", None)
@@ -1047,11 +1165,29 @@ class MainWindow(QMainWindow):
             ):
                 dlg.finish("cancel")
 
+        cpu_settings = self.config.setdefault("cpu_settings", {})
+        cpu_defaults = {
+            "cpu_comparison": "less",
+            "cpu_threshold": 10,
+            "cpu_duration_seconds": 300,
+            "cpu_use_average": False,
+            "cpu_average_seconds": 60,
+        }
+        for schedule in schedules:
+            configured = {
+                key: getattr(schedule, key)
+                for key in cpu_defaults
+            }
+            if configured != cpu_defaults:
+                cpu_settings[schedule.id] = configured
+            else:
+                cpu_settings.pop(schedule.id, None)
         self.config["schedules"] = [schedule_to_dict(s) for s in schedules]
         save_json(CONFIG_FILE, self.config)
 
         removed_ids = previous_ids - set(schedules_by_id)
         for schedule_id in removed_ids:
+            cpu_settings.pop(schedule_id, None)
             for state_key in (
                 "last_runs",
                 "snoozes",
@@ -1234,12 +1370,33 @@ class MainWindow(QMainWindow):
         return self.config.get("input_monitor_enabled", True) and bool(self.input_monitor_status.get("available")) and int(self.input_monitor_status.get("accessible",0)) > 0
 
     def evaluate_conditions(self, s, now, occurrence=None, pending=False):
+        cpu_usage = None
+        cpu_average = None
+        cpu_reliable = False
+        cpu_status = "cpu_monitor_unavailable"
+        if getattr(s, "require_cpu", False):
+            monitor = getattr(self, "cpu_monitor", None)
+            if monitor is not None:
+                average_window = (
+                    int(getattr(s, "cpu_average_seconds", 60))
+                    if getattr(s, "cpu_use_average", False)
+                    else 0
+                )
+                reading = monitor.reading(average_window)
+                cpu_usage = reading.usage_percent
+                cpu_average = reading.average_percent
+                cpu_reliable = reading.reliable
+                cpu_status = reading.reason
         context = ConditionContext(
             now=now,
             occurrence=occurrence,
             occurrence_pending=pending,
             idle_seconds=self.idle_seconds(),
             idle_reliable=self.input_monitor_reliable(),
+            cpu_usage=cpu_usage,
+            cpu_average=cpu_average,
+            cpu_reliable=cpu_reliable,
+            cpu_status=cpu_status,
         )
         return self.condition_engine.evaluate(s, context)
 
@@ -1300,21 +1457,91 @@ class MainWindow(QMainWindow):
             if denied: status += f"; {denied} sin permiso"
         self.activity_label.setText(f"<b>Estado:</b> {status}<br><b>Inactividad actual:</b> {mins} min {secs} s<br><b>Última actividad:</b> {self.last_activity_device}")
 
-    def defer_for_idle(self, s, occurrence, now):
-        threshold = max(60, int(s.idle_minutes)*60); idle = int(self.idle_seconds())
-        if self.input_monitor_reliable():
-            missing = max(60, threshold-idle+2)
-            reason = f"Se detectó actividad. «{s.name}» requiere {s.idle_minutes} min sin usar mouse, teclado o mando."
-        else:
-            missing = 300
-            reason = f"«{s.name}» requiere inactividad, pero AMP AutoPower no puede leer dispositivos de entrada. Se reintentará en 5 minutos por seguridad."
-        dt = now + timedelta(seconds=missing)
+    def _defer_for_conditions(self, s, occurrence, now, evaluation):
+        delays = []
+        reasons = []
+        idle_result = evaluation.for_type("idle")
+        if idle_result and idle_result.enabled and not idle_result.satisfied:
+            threshold = max(60, int(s.idle_minutes) * 60)
+            idle = int(self.idle_seconds())
+            if self.input_monitor_reliable():
+                delays.append(max(60, threshold - idle + 2))
+                reasons.append(
+                    f"Se detectó actividad; se requieren {s.idle_minutes} min "
+                    "sin usar mouse, teclado o mando."
+                )
+            else:
+                delays.append(300)
+                reasons.append(
+                    "No se puede comprobar la inactividad por falta de acceso "
+                    "al monitor de entrada."
+                )
+
+        cpu_result = evaluation.for_type("cpu")
+        if cpu_result and cpu_result.enabled and not cpu_result.satisfied:
+            info = cpu_result.info
+            if not info.get("reliable"):
+                delays.append(30)
+                reasons.append(
+                    f"La condición CPU no está disponible ({cpu_result.reason})."
+                )
+            elif info.get("threshold_met"):
+                elapsed = cpu_result.satisfied_for_seconds or 0
+                missing = max(
+                    1,
+                    int(info.get("minimum_seconds", 0) - elapsed + 1),
+                )
+                delays.append(missing)
+                reasons.append("La CPU aún no cumple la duración continua.")
+            else:
+                delays.append(30)
+                comparison = (
+                    "mayor que"
+                    if info.get("comparison") == "greater"
+                    else "menor que"
+                )
+                reasons.append(
+                    f"La CPU debe ser {comparison} {info.get('threshold'):g} %."
+                )
+
+        if not reasons:
+            return
+        dt = now + timedelta(seconds=min(delays))
         if now >= occurrence.scheduled_target:
             occurrence = occurrence.mark_armed()
         occurrence = occurrence.with_next_check(dt)
         self.save_pending_occurrence(occurrence)
-        self.notify("Esperando inactividad", f"{reason} Próxima comprobación: {dt.strftime('%H:%M')}.", True)
-        if self.config.get("overlay_all_schedule_warnings", True): self.show_warning_banner("AMP AutoPower — esperando inactividad", reason, 10000)
+        reason = f"«{s.name}»: {' '.join(reasons)}"
+        notified = getattr(self, "_condition_wait_notified", {})
+        previous_notice = notified.get(s.id)
+        should_notify = (
+            previous_notice is None
+            or previous_notice[0] != reason
+            or (now - previous_notice[1]).total_seconds() >= 300
+        )
+        if should_notify:
+            notified[s.id] = (reason, now)
+            self._condition_wait_notified = notified
+            self.notify(
+                "Esperando condiciones",
+                f"{reason} Próxima comprobación: {dt.strftime('%H:%M:%S')}.",
+                True,
+            )
+            if self.config.get("overlay_all_schedule_warnings", True):
+                self.show_warning_banner(
+                    "AMP AutoPower — esperando condiciones",
+                    reason,
+                    10000,
+                )
+
+    def defer_for_idle(self, s, occurrence, now):
+        evaluation = self.evaluate_conditions(
+            s,
+            now,
+            occurrence,
+            pending=True,
+        )
+        self._defer_for_conditions(s, occurrence, now, evaluation)
 
     def _has_active_dialog_for_schedule(self, schedule_id):
         for dlg in self.active_dialogs.values():
@@ -1643,13 +1870,7 @@ class MainWindow(QMainWindow):
                 occurrence.next_check_at is None
                 or now >= occurrence.next_check_at
             ):
-                idle_result = evaluation.for_type("idle")
-                if (
-                    idle_result
-                    and idle_result.enabled
-                    and not idle_result.satisfied
-                ):
-                    self.defer_for_idle(s, occurrence, now)
+                self._defer_for_conditions(s, occurrence, now, evaluation)
             return
 
         # Si una condición se completa durante la ventana previa, todavía
@@ -1666,14 +1887,8 @@ class MainWindow(QMainWindow):
                 )
             return
 
-        if (
-            occurrence.next_check_at
-            and now < occurrence.next_check_at
-            and not snooze_expired
-        ):
-            return
-
         if evaluation.ready_for_countdown:
+            getattr(self, "_condition_wait_notified", {}).pop(s.id, None)
             if occurrence.next_check_at:
                 occurrence = occurrence.with_next_check(None)
                 self.save_pending_occurrence(occurrence)
@@ -1686,9 +1901,14 @@ class MainWindow(QMainWindow):
             )
             return
 
-        idle_result = evaluation.for_type("idle")
-        if idle_result and idle_result.enabled and not idle_result.satisfied:
-            self.defer_for_idle(s, occurrence, now)
+        if (
+            occurrence.next_check_at
+            and now < occurrence.next_check_at
+            and not snooze_expired
+        ):
+            return
+
+        self._defer_for_conditions(s, occurrence, now, evaluation)
 
     def _timed_schedule_tick(self, s, now):
         pending = self.pending_occurrence(s)
@@ -1745,6 +1965,8 @@ class MainWindow(QMainWindow):
                             12000 if mins <= 5 else 9000,
                         )
 
+        evaluation = self.evaluate_conditions(s, now, occurrence)
+
         if not 0 < remaining <= s.final_countdown_seconds:
             return
 
@@ -1752,11 +1974,8 @@ class MainWindow(QMainWindow):
         if key in self.active_dialogs:
             return
 
-        evaluation = self.evaluate_conditions(s, now, occurrence)
         if not evaluation.ready_for_countdown:
-            idle_result = evaluation.for_type("idle")
-            if idle_result and idle_result.enabled and not idle_result.satisfied:
-                self.defer_for_idle(s, occurrence, now)
+            self._defer_for_conditions(s, occurrence, now, evaluation)
             return
 
         self.start_final_countdown(
@@ -1775,7 +1994,20 @@ class MainWindow(QMainWindow):
             if dayprefix in x
         }
 
-        for s in self.schedules():
+        schedules = self.schedules()
+        if any(s.enabled and s.require_cpu for s in schedules):
+            cpu_reading = self.cpu_monitor.sample()
+            if (
+                not cpu_reading.reliable
+                and cpu_reading.reason.startswith("cpu_monitor_error")
+                and cpu_reading.reason != self._last_cpu_monitor_error
+            ):
+                log(f"Monitor CPU no disponible: {cpu_reading.reason}")
+                self._last_cpu_monitor_error = cpu_reading.reason
+            elif cpu_reading.reliable:
+                self._last_cpu_monitor_error = None
+
+        for s in schedules:
             if not s.enabled:
                 continue
 

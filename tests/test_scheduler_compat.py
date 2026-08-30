@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from amp_autopower import MainWindow, Schedule, schedule_to_dict
 from condition_engine import (
+    CPUReading,
     ConditionEngine,
     ScheduledOccurrence,
     schedule_trigger_mode,
@@ -26,12 +27,19 @@ class SchedulerHarness:
     execute_action = MainWindow.execute_action
     evaluate_conditions = MainWindow.evaluate_conditions
     defer_for_idle = MainWindow.defer_for_idle
+    _defer_for_conditions = MainWindow._defer_for_conditions
     _has_active_dialog_for_schedule = MainWindow._has_active_dialog_for_schedule
     _pending_occurrence_tick = MainWindow._pending_occurrence_tick
     set_schedules = MainWindow.set_schedules
     mark_skipped = MainWindow.mark_skipped
 
-    def __init__(self, state, idle_seconds=0, reliable=True):
+    def __init__(
+        self,
+        state,
+        idle_seconds=0,
+        reliable=True,
+        cpu_reading=None,
+    ):
         self.state = state
         self.condition_engine = ConditionEngine()
         self.active_dialogs = {}
@@ -41,6 +49,15 @@ class SchedulerHarness:
         }
         self._idle_seconds = idle_seconds
         self._reliable = reliable
+        self._cpu_reading = cpu_reading or CPUReading(
+            None,
+            None,
+            False,
+            "cpu_monitor_warming_up",
+        )
+        self.cpu_monitor = SimpleNamespace(
+            reading=lambda _window=0: self._cpu_reading,
+        )
         self.started = []
 
     def idle_seconds(self):
@@ -59,7 +76,16 @@ class SchedulerHarness:
         self.started.append((schedule.id, target, seconds, key))
 
     def schedules(self):
-        return [Schedule(**raw) for raw in self.config.get("schedules", [])]
+        out = []
+        cpu_settings = self.config.get("cpu_settings", {})
+        for raw in self.config.get("schedules", []):
+            data = dict(raw)
+            preset = cpu_settings.get(data.get("id"), {})
+            if isinstance(preset, dict):
+                for key, value in preset.items():
+                    data.setdefault(key, value)
+            out.append(Schedule(**data))
+        return out
 
     def refresh_list(self):
         pass
@@ -98,6 +124,41 @@ class SchedulerCompatibilityTests(unittest.TestCase):
             serialized = schedule_to_dict(item)
             self.assertNotIn("trigger_mode", serialized)
             self.assertNotIn("interval_minutes", serialized)
+            self.assertNotIn("require_cpu", serialized)
+            self.assertNotIn("cpu_threshold", serialized)
+
+    def test_disabled_cpu_preserves_custom_configuration(self):
+        item = Schedule(
+            id="cpu",
+            require_cpu=False,
+            cpu_comparison="greater",
+            cpu_threshold=80,
+            cpu_duration_seconds=30,
+            cpu_use_average=True,
+            cpu_average_seconds=15,
+        )
+
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        with patch("amp_autopower.save_json"):
+            harness.set_schedules([item])
+        serialized = harness.config["schedules"][0]
+        restored = harness.schedules()[0]
+
+        self.assertNotIn("require_cpu", serialized)
+        self.assertNotIn("cpu_threshold", serialized)
+        self.assertFalse(restored.require_cpu)
+        self.assertEqual(restored.cpu_comparison, "greater")
+        self.assertEqual(restored.cpu_threshold, 80)
+        self.assertEqual(restored.cpu_duration_seconds, 30)
+        self.assertTrue(restored.cpu_use_average)
+        self.assertEqual(restored.cpu_average_seconds, 15)
 
     def test_switching_interval_to_time_discards_interval_occurrence(self):
         interval = Schedule(
@@ -614,6 +675,250 @@ class SchedulerCompatibilityTests(unittest.TestCase):
             start_at + timedelta(minutes=90),
         )
         self.assertNotEqual(first_occurrence, second_occurrence)
+
+    def test_time_and_cpu_pending_keeps_original_target(self):
+        target = datetime(2026, 8, 31, 23, 30)
+        occurrence = ScheduledOccurrence.create("timed", target, 60)
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {"timed": occurrence.to_state()},
+        }
+        item = Schedule(
+            id="timed",
+            time="23:30",
+            weekdays=[0],
+            require_cpu=True,
+            cpu_threshold=10,
+            cpu_duration_seconds=300,
+        )
+        harness = SchedulerHarness(
+            state,
+            cpu_reading=CPUReading(50.0, None, True, "cpu_sample_available"),
+        )
+
+        with patch("amp_autopower.save_json"):
+            harness._pending_occurrence_tick(item, occurrence, target)
+
+        persisted = harness.pending_occurrence(item)
+        self.assertTrue(persisted.armed)
+        self.assertEqual(persisted.scheduled_target, target)
+        self.assertEqual(harness.started, [])
+
+    def test_editing_cpu_condition_resets_continuous_duration(self):
+        started = datetime(2026, 8, 31, 22, 0)
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        item = Schedule(
+            id="timed",
+            time="23:30",
+            weekdays=[0],
+            require_cpu=True,
+            cpu_threshold=10,
+            cpu_duration_seconds=300,
+        )
+        harness = SchedulerHarness(
+            state,
+            cpu_reading=CPUReading(5.0, None, True, "cpu_sample_available"),
+        )
+        occurrence = ScheduledOccurrence.create(
+            item.id,
+            datetime(2026, 8, 31, 23, 30),
+            60,
+        )
+        harness.evaluate_conditions(item, started, occurrence)
+        self.assertEqual(
+            harness.condition_engine.runtime.cpu_satisfied_since(item.id),
+            started,
+        )
+
+        updated = Schedule(**{**asdict(item), "cpu_threshold": 15})
+        with patch("amp_autopower.save_json"):
+            harness.set_schedules([updated], now=started + timedelta(minutes=1))
+
+        self.assertIsNone(
+            harness.condition_engine.runtime.cpu_satisfied_since(item.id)
+        )
+
+    def test_editing_another_schedule_keeps_cpu_continuous_duration(self):
+        started = datetime(2026, 8, 31, 22, 0)
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        cpu_item = Schedule(
+            id="cpu",
+            require_cpu=True,
+            cpu_threshold=10,
+            cpu_duration_seconds=300,
+        )
+        other = Schedule(id="other", name="Original")
+        harness = SchedulerHarness(
+            state,
+            cpu_reading=CPUReading(5.0, None, True, "cpu_sample_available"),
+        )
+        harness.config["schedules"] = [
+            schedule_to_dict(cpu_item),
+            schedule_to_dict(other),
+        ]
+        occurrence = ScheduledOccurrence.create(
+            cpu_item.id,
+            datetime(2026, 8, 31, 23, 30),
+            60,
+        )
+        harness.evaluate_conditions(cpu_item, started, occurrence)
+        updated_other = Schedule(**{**asdict(other), "name": "Updated"})
+
+        with patch("amp_autopower.save_json"):
+            harness.set_schedules(
+                [cpu_item, updated_other],
+                now=started + timedelta(minutes=1),
+            )
+
+        self.assertEqual(
+            harness.condition_engine.runtime.cpu_satisfied_since(cpu_item.id),
+            started,
+        )
+
+    def test_interval_and_cpu_pending_keeps_original_target(self):
+        start = datetime(2026, 8, 31, 22, 30)
+        occurrence = ScheduledOccurrence.create_interval(
+            "interval",
+            start,
+            60,
+            60,
+        )
+        target = occurrence.scheduled_target
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {"interval": occurrence.to_state()},
+            "completed_intervals": {},
+        }
+        item = Schedule(
+            id="interval",
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=60,
+            weekdays=[],
+            require_cpu=True,
+            cpu_threshold=10,
+            cpu_duration_seconds=300,
+        )
+        harness = SchedulerHarness(
+            state,
+            cpu_reading=CPUReading(50.0, None, True, "cpu_sample_available"),
+        )
+
+        with patch("amp_autopower.save_json"):
+            harness._pending_occurrence_tick(item, occurrence, target)
+
+        persisted = harness.pending_occurrence(item)
+        self.assertTrue(persisted.armed)
+        self.assertEqual(persisted.start_at, start)
+        self.assertEqual(persisted.scheduled_target, target)
+        self.assertEqual(harness.started, [])
+
+    def test_cpu_snooze_keeps_original_interval_and_target(self):
+        start = datetime(2026, 8, 31, 22, 30)
+        occurrence = ScheduledOccurrence.create_interval(
+            "interval",
+            start,
+            60,
+            60,
+        ).mark_armed()
+        target = occurrence.scheduled_target
+        snooze = target + timedelta(minutes=10)
+        state = {
+            "last_runs": {},
+            "snoozes": {"interval": snooze.isoformat()},
+            "skipped_targets": {},
+            "pending_occurrences": {"interval": occurrence.to_state()},
+            "completed_intervals": {},
+        }
+        item = Schedule(
+            id="interval",
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=60,
+            weekdays=[],
+            require_cpu=True,
+            cpu_threshold=10,
+            cpu_duration_seconds=300,
+        )
+        harness = SchedulerHarness(
+            state,
+            cpu_reading=CPUReading(50.0, None, True, "cpu_sample_available"),
+        )
+
+        with patch("amp_autopower.save_json"):
+            harness._pending_occurrence_tick(
+                item,
+                occurrence,
+                snooze - timedelta(seconds=60),
+            )
+
+        persisted = harness.pending_occurrence(item)
+        self.assertEqual(persisted.start_at, start)
+        self.assertEqual(persisted.scheduled_target, target)
+        self.assertEqual(item.cpu_duration_seconds, 300)
+        self.assertEqual(harness.started, [])
+
+    def test_cpu_pending_can_cross_midnight_without_changing_target(self):
+        target = datetime(2026, 9, 4, 23, 30)
+        occurrence = ScheduledOccurrence.create(
+            "timed",
+            target,
+            60,
+        ).mark_armed()
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {"timed": occurrence.to_state()},
+        }
+        item = Schedule(
+            id="timed",
+            time="23:30",
+            weekdays=[4],
+            require_cpu=True,
+            cpu_threshold=10,
+            cpu_duration_seconds=60,
+        )
+        harness = SchedulerHarness(
+            state,
+            cpu_reading=CPUReading(5.0, None, True, "cpu_sample_available"),
+        )
+
+        with patch("amp_autopower.save_json"):
+            harness._pending_occurrence_tick(item, occurrence, target)
+            persisted = harness.pending_occurrence(item)
+            for seconds in range(1, 40 * 60 + 1):
+                harness.evaluate_conditions(
+                    item,
+                    target + timedelta(seconds=seconds),
+                    persisted,
+                    pending=True,
+                )
+            harness._pending_occurrence_tick(
+                item,
+                persisted,
+                target + timedelta(minutes=40),
+            )
+
+        self.assertEqual(len(harness.started), 1)
+        self.assertEqual(harness.started[0][1], target)
+        self.assertEqual(harness.pending_occurrence(item).scheduled_target, target)
 
     def test_pending_occurrence_survives_restart_and_uses_original_target(self):
         target = datetime(2026, 9, 4, 23, 30)

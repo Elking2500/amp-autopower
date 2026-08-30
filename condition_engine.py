@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
+import time
 from typing import Any, Dict, Optional, Tuple
 
 
@@ -136,6 +137,10 @@ class ConditionContext:
     occurrence_pending: bool = False
     idle_seconds: float = 0.0
     idle_reliable: bool = False
+    cpu_usage: Optional[float] = None
+    cpu_average: Optional[float] = None
+    cpu_reliable: bool = False
+    cpu_status: str = "cpu_monitor_unavailable"
 
 
 @dataclass(frozen=True)
@@ -322,6 +327,255 @@ class IdleCondition(Condition):
         )
 
 
+class CPUCondition(Condition):
+    condition_type = "cpu"
+
+    def __init__(
+        self,
+        comparison: str,
+        threshold: float,
+        minimum_seconds: int,
+        use_average: bool = False,
+        enabled: bool = True,
+    ):
+        super().__init__(enabled)
+        self.comparison = (
+            "greater" if str(comparison).lower() == "greater" else "less"
+        )
+        self.threshold = min(100.0, max(0.0, float(threshold)))
+        self.minimum_seconds = max(0, int(minimum_seconds))
+        self.use_average = bool(use_average)
+
+    def evaluate(self, context: ConditionContext) -> ConditionResult:
+        if not self.enabled:
+            return self.disabled_result()
+
+        value = context.cpu_average if self.use_average else context.cpu_usage
+        reliable = bool(context.cpu_reliable) and value is not None
+        threshold_met = False
+        if reliable:
+            if self.comparison == "greater":
+                threshold_met = value > self.threshold
+            else:
+                threshold_met = value < self.threshold
+
+        if not reliable:
+            reason = context.cpu_status or "cpu_monitor_unavailable"
+        elif threshold_met:
+            reason = "cpu_threshold_met"
+        else:
+            reason = "waiting_for_cpu_threshold"
+
+        return ConditionResult(
+            condition_type=self.condition_type,
+            enabled=True,
+            satisfied=threshold_met,
+            info={
+                "usage_percent": context.cpu_usage,
+                "average_percent": context.cpu_average,
+                "value_percent": value,
+                "threshold": self.threshold,
+                "comparison": self.comparison,
+                "minimum_seconds": self.minimum_seconds,
+                "use_average": self.use_average,
+                "reliable": reliable,
+                "threshold_met": threshold_met,
+            },
+            reason=reason,
+        )
+
+
+@dataclass(frozen=True)
+class CPUReading:
+    usage_percent: Optional[float]
+    average_percent: Optional[float]
+    reliable: bool
+    reason: str
+
+
+class CPUMonitor:
+    """Muestrea el agregado de /proc/stat sin temporizadores ni dependencias Qt."""
+
+    def __init__(
+        self,
+        sample_interval_seconds: float = 1.0,
+        retention_seconds: float = 86400.0,
+        reader=None,
+        clock=None,
+    ):
+        self.sample_interval_seconds = max(0.1, float(sample_interval_seconds))
+        self.retention_seconds = max(60.0, float(retention_seconds))
+        self.reader = reader or self._read_proc_stat
+        self.clock = clock or time.monotonic
+        self._last_attempt_at = None
+        self._previous_counters = None
+        self._previous_sample_at = None
+        self._usage_percent = None
+        self._counter_samples = []
+        self._reason = "cpu_monitor_warming_up"
+
+    @staticmethod
+    def _read_proc_stat():
+        with open("/proc/stat", "r", encoding="ascii") as proc_stat:
+            return proc_stat.readline()
+
+    @staticmethod
+    def parse_counters(raw: str) -> Tuple[int, int]:
+        line = str(raw).splitlines()[0] if str(raw).splitlines() else ""
+        fields = line.split()
+        if not fields or fields[0] != "cpu" or len(fields) < 5:
+            raise ValueError("línea agregada de CPU inválida")
+        values = [int(value) for value in fields[1:]]
+        user = values[0]
+        nice = values[1] if len(values) > 1 else 0
+        system = values[2] if len(values) > 2 else 0
+        idle = values[3] if len(values) > 3 else 0
+        iowait = values[4] if len(values) > 4 else 0
+        irq = values[5] if len(values) > 5 else 0
+        softirq = values[6] if len(values) > 6 else 0
+        steal = values[7] if len(values) > 7 else 0
+        idle_total = idle + iowait
+        total = idle_total + user + nice + system + irq + softirq + steal
+        return total, idle_total
+
+    @staticmethod
+    def calculate_usage(previous: Tuple[int, int], current: Tuple[int, int]):
+        total_delta = current[0] - previous[0]
+        idle_delta = current[1] - previous[1]
+        if total_delta <= 0 or idle_delta < 0:
+            raise ValueError("contadores de CPU no avanzaron")
+        busy_delta = min(total_delta, max(0, total_delta - idle_delta))
+        return 100.0 * busy_delta / total_delta
+
+    def record(self, raw: str, sampled_at: Optional[float] = None):
+        sampled_at = self.clock() if sampled_at is None else float(sampled_at)
+        counters = self.parse_counters(raw)
+        previous = self._previous_counters
+        previous_at = self._previous_sample_at
+        self._previous_counters = counters
+        self._previous_sample_at = sampled_at
+        if (
+            previous is None
+            or previous_at is None
+            or sampled_at - previous_at > self.sample_interval_seconds * 3
+        ):
+            self._usage_percent = None
+            self._counter_samples = [(sampled_at, counters)]
+            self._reason = "cpu_monitor_warming_up"
+            return self.reading()
+
+        try:
+            usage = self.calculate_usage(previous, counters)
+        except ValueError as e:
+            self._usage_percent = None
+            self._counter_samples = [(sampled_at, counters)]
+            self._reason = f"cpu_monitor_error: {e}"
+            return self.reading()
+
+        self._usage_percent = usage
+        self._reason = "cpu_sample_available"
+        self._counter_samples.append((sampled_at, counters))
+        cutoff = sampled_at - self.retention_seconds
+        recent = [
+            sample for sample in self._counter_samples if sample[0] >= cutoff
+        ]
+        older = [
+            sample for sample in self._counter_samples if sample[0] < cutoff
+        ]
+        self._counter_samples = older[-1:] + recent
+        return self.reading()
+
+    def sample(self, force: bool = False):
+        now = self.clock()
+        if (
+            not force
+            and self._last_attempt_at is not None
+            and now - self._last_attempt_at < self.sample_interval_seconds
+        ):
+            return self.reading()
+        self._last_attempt_at = now
+        try:
+            return self.record(self.reader(), sampled_at=now)
+        except (OSError, ValueError, IndexError) as e:
+            self._usage_percent = None
+            self._previous_counters = None
+            self._previous_sample_at = None
+            self._counter_samples = []
+            self._reason = f"cpu_monitor_error: {e}"
+            return self.reading()
+
+    def reading(self, average_window_seconds: int = 0) -> CPUReading:
+        if self._usage_percent is None:
+            return CPUReading(None, None, False, self._reason)
+
+        window = max(0, int(average_window_seconds))
+        if not window:
+            return CPUReading(
+                self._usage_percent,
+                None,
+                True,
+                self._reason,
+            )
+
+        if not self._counter_samples:
+            return CPUReading(
+                self._usage_percent,
+                None,
+                False,
+                "cpu_average_warming_up",
+            )
+        newest_at, newest_counters = self._counter_samples[-1]
+        cutoff = newest_at - window
+        before = [
+            sample for sample in self._counter_samples if sample[0] <= cutoff
+        ]
+        after = [
+            sample for sample in self._counter_samples if sample[0] >= cutoff
+        ]
+        if not before or not after:
+            return CPUReading(
+                self._usage_percent,
+                None,
+                False,
+                "cpu_average_warming_up",
+            )
+        before_at, before_counters = before[-1]
+        after_at, after_counters = after[0]
+        if after_at == before_at:
+            baseline_counters = before_counters
+        else:
+            bracket = after_at - before_at
+            if bracket > self.sample_interval_seconds * 1.5:
+                return CPUReading(
+                    self._usage_percent,
+                    None,
+                    False,
+                    "cpu_average_warming_up",
+                )
+            position = (cutoff - before_at) / bracket
+            baseline_counters = (
+                before_counters[0]
+                + (after_counters[0] - before_counters[0]) * position,
+                before_counters[1]
+                + (after_counters[1] - before_counters[1]) * position,
+            )
+        try:
+            average = self.calculate_usage(baseline_counters, newest_counters)
+        except ValueError:
+            return CPUReading(
+                self._usage_percent,
+                None,
+                False,
+                "cpu_average_warming_up",
+            )
+        return CPUReading(
+            self._usage_percent,
+            average,
+            True,
+            "cpu_average_available",
+        )
+
+
 class ConditionRuntimeState:
     """Estado temporal separado de la configuración persistente."""
 
@@ -329,6 +583,8 @@ class ConditionRuntimeState:
         self.activity_generation = 0
         self._idle_triggered_generation = {}
         self._idle_snooze_generation = {}
+        self._cpu_satisfied_since = {}
+        self._cpu_last_evaluated_at = {}
 
     def record_activity(self):
         self.activity_generation += 1
@@ -355,6 +611,27 @@ class ConditionRuntimeState:
     def clear_idle_snooze(self, schedule_id: str):
         self._idle_snooze_generation.pop(schedule_id, None)
 
+    def cpu_satisfied_since(self, schedule_id: str) -> Optional[datetime]:
+        return self._cpu_satisfied_since.get(schedule_id)
+
+    def mark_cpu_satisfied(self, schedule_id: str, now: datetime) -> datetime:
+        return self._cpu_satisfied_since.setdefault(schedule_id, now)
+
+    def clear_cpu_satisfied(self, schedule_id: str):
+        self._cpu_satisfied_since.pop(schedule_id, None)
+
+    def record_cpu_evaluation(self, schedule_id: str, now: datetime) -> bool:
+        previous = self._cpu_last_evaluated_at.get(schedule_id)
+        self._cpu_last_evaluated_at[schedule_id] = now
+        if previous is None:
+            return False
+        gap = (now - previous).total_seconds()
+        return 0 <= gap <= 5
+
+    def clear_cpu_runtime(self, schedule_id: str):
+        self.clear_cpu_satisfied(schedule_id)
+        self._cpu_last_evaluated_at.pop(schedule_id, None)
+
 
 class ConditionEngine:
     def __init__(self):
@@ -378,6 +655,13 @@ class ConditionEngine:
             TimeCondition(enabled=trigger_mode == "time"),
             IntervalCondition(enabled=trigger_mode == "interval"),
             IdleCondition(idle_seconds, enabled=idle_enabled),
+            CPUCondition(
+                getattr(schedule, "cpu_comparison", "less"),
+                getattr(schedule, "cpu_threshold", 10),
+                getattr(schedule, "cpu_duration_seconds", 300),
+                use_average=getattr(schedule, "cpu_use_average", False),
+                enabled=getattr(schedule, "require_cpu", False),
+            ),
         )
 
     def evaluate(
@@ -385,10 +669,18 @@ class ConditionEngine:
         schedule,
         context: ConditionContext,
     ) -> ScheduleConditionResult:
-        results = tuple(
-            condition.evaluate(context)
-            for condition in self.conditions_for(schedule)
-        )
+        results = []
+        for condition in self.conditions_for(schedule):
+            result = condition.evaluate(context)
+            if condition.condition_type == "cpu":
+                result = self._apply_cpu_duration(
+                    str(getattr(schedule, "id", "")),
+                    condition,
+                    result,
+                    context.now,
+                )
+            results.append(result)
+        results = tuple(results)
         non_temporal_results = tuple(
             result
             for result in results
@@ -479,4 +771,44 @@ class ConditionEngine:
             pending=pending,
             other_conditions_ready=other_conditions_ready,
             conditions=results,
+        )
+
+    def _apply_cpu_duration(
+        self,
+        schedule_id: str,
+        condition: CPUCondition,
+        result: ConditionResult,
+        now: datetime,
+    ) -> ConditionResult:
+        if not result.enabled:
+            self.runtime.clear_cpu_runtime(schedule_id)
+            return result
+
+        continuous_observation = self.runtime.record_cpu_evaluation(
+            schedule_id,
+            now,
+        )
+        if not continuous_observation:
+            self.runtime.clear_cpu_satisfied(schedule_id)
+
+        if not result.satisfied:
+            self.runtime.clear_cpu_satisfied(schedule_id)
+            return result
+
+        satisfied_since = self.runtime.mark_cpu_satisfied(schedule_id, now)
+        elapsed = max(0.0, (now - satisfied_since).total_seconds())
+        satisfied = elapsed >= condition.minimum_seconds
+        info = dict(result.info)
+        info["threshold_met"] = True
+        if satisfied:
+            reason = "cpu_duration_reached"
+        else:
+            reason = "waiting_for_cpu_duration"
+        return replace(
+            result,
+            satisfied=satisfied,
+            info=info,
+            satisfied_since=satisfied_since,
+            satisfied_for_seconds=elapsed,
+            reason=reason,
         )

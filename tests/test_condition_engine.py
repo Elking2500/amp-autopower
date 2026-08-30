@@ -263,6 +263,219 @@ class ConditionEngineTests(unittest.TestCase):
         self.assertEqual(result.scheduled_target, target)
         self.assertEqual(result.for_type("interval").info["start_at"], start_at)
 
+    def test_cpu_less_than_threshold(self):
+        result = self.engine.evaluate(
+            schedule(
+                require_cpu=True,
+                cpu_comparison="less",
+                cpu_threshold=10,
+                cpu_duration_seconds=0,
+            ),
+            context(
+                MONDAY_TARGET - timedelta(seconds=60),
+                cpu_usage=9.0,
+                cpu_reliable=True,
+                cpu_status="cpu_sample_available",
+            ),
+        )
+
+        self.assertTrue(result.for_type("cpu").satisfied)
+        self.assertEqual(result.for_type("cpu").info["value_percent"], 9.0)
+
+    def test_cpu_greater_than_threshold(self):
+        result = self.engine.evaluate(
+            schedule(
+                require_cpu=True,
+                cpu_comparison="greater",
+                cpu_threshold=80,
+                cpu_duration_seconds=0,
+            ),
+            context(
+                MONDAY_TARGET - timedelta(seconds=60),
+                cpu_usage=81.0,
+                cpu_reliable=True,
+                cpu_status="cpu_sample_available",
+            ),
+        )
+
+        self.assertTrue(result.for_type("cpu").satisfied)
+
+    def test_cpu_continuous_duration_and_reset(self):
+        item = schedule(
+            require_cpu=True,
+            cpu_comparison="less",
+            cpu_threshold=10,
+            cpu_duration_seconds=30,
+        )
+        started = MONDAY_TARGET - timedelta(minutes=2)
+
+        samples = []
+        for seconds in range(31):
+            samples.append(self.engine.evaluate(
+                item,
+                context(
+                    started + timedelta(seconds=seconds),
+                    cpu_usage=5.0,
+                    cpu_reliable=True,
+                    cpu_status="cpu_sample_available",
+                ),
+            ))
+        first = samples[0]
+        almost = samples[29]
+        reached = samples[30]
+        broken = self.engine.evaluate(
+            item,
+            context(
+                started + timedelta(seconds=31),
+                cpu_usage=50.0,
+                cpu_reliable=True,
+                cpu_status="cpu_sample_available",
+            ),
+        )
+        restarted = self.engine.evaluate(
+            item,
+            context(
+                started + timedelta(seconds=32),
+                cpu_usage=5.0,
+                cpu_reliable=True,
+                cpu_status="cpu_sample_available",
+            ),
+        )
+
+        self.assertFalse(first.for_type("cpu").satisfied)
+        self.assertFalse(almost.for_type("cpu").satisfied)
+        self.assertTrue(reached.for_type("cpu").satisfied)
+        self.assertEqual(reached.for_type("cpu").satisfied_for_seconds, 30)
+        self.assertFalse(broken.for_type("cpu").satisfied)
+        self.assertFalse(restarted.for_type("cpu").satisfied)
+        self.assertEqual(restarted.for_type("cpu").satisfied_for_seconds, 0)
+
+    def test_cpu_duration_resets_after_evaluation_gap(self):
+        item = schedule(
+            require_cpu=True,
+            cpu_threshold=10,
+            cpu_duration_seconds=30,
+        )
+        started = MONDAY_TARGET - timedelta(minutes=2)
+        first = self.engine.evaluate(
+            item,
+            context(
+                started,
+                cpu_usage=5.0,
+                cpu_reliable=True,
+                cpu_status="cpu_sample_available",
+            ),
+        )
+        after_gap = self.engine.evaluate(
+            item,
+            context(
+                started + timedelta(minutes=1),
+                cpu_usage=5.0,
+                cpu_reliable=True,
+                cpu_status="cpu_sample_available",
+            ),
+        )
+
+        self.assertFalse(first.for_type("cpu").satisfied)
+        self.assertFalse(after_gap.for_type("cpu").satisfied)
+        self.assertEqual(after_gap.for_type("cpu").satisfied_for_seconds, 0)
+
+    def test_cpu_average_is_used_when_enabled(self):
+        result = self.engine.evaluate(
+            schedule(
+                require_cpu=True,
+                cpu_comparison="less",
+                cpu_threshold=25,
+                cpu_duration_seconds=0,
+                cpu_use_average=True,
+            ),
+            context(
+                MONDAY_TARGET - timedelta(seconds=60),
+                cpu_usage=90.0,
+                cpu_average=20.0,
+                cpu_reliable=True,
+                cpu_status="cpu_average_available",
+            ),
+        )
+
+        self.assertTrue(result.for_type("cpu").satisfied)
+        self.assertEqual(result.for_type("cpu").info["value_percent"], 20.0)
+
+    def test_cpu_monitor_error_is_not_satisfied(self):
+        result = self.engine.evaluate(
+            schedule(require_cpu=True, cpu_duration_seconds=0),
+            context(
+                MONDAY_TARGET - timedelta(seconds=60),
+                cpu_usage=None,
+                cpu_reliable=False,
+                cpu_status="cpu_monitor_error: simulated",
+            ),
+        )
+
+        self.assertFalse(result.for_type("cpu").satisfied)
+        self.assertEqual(
+            result.for_type("cpu").reason,
+            "cpu_monitor_error: simulated",
+        )
+        self.assertFalse(result.ready_for_countdown)
+
+    def test_cpu_runtime_starts_empty_after_restart(self):
+        item = schedule(
+            require_cpu=True,
+            cpu_threshold=10,
+            cpu_duration_seconds=30,
+        )
+        restarted_engine = ConditionEngine()
+        result = restarted_engine.evaluate(
+            item,
+            context(
+                MONDAY_TARGET,
+                cpu_usage=5.0,
+                cpu_reliable=True,
+                cpu_status="cpu_sample_available",
+            ),
+        )
+
+        self.assertFalse(result.for_type("cpu").satisfied)
+        self.assertEqual(result.for_type("cpu").satisfied_for_seconds, 0)
+
+    def test_cpu_and_idle_use_and_semantics(self):
+        item = schedule(
+            require_idle=True,
+            idle_minutes=30,
+            require_cpu=True,
+            cpu_threshold=10,
+            cpu_duration_seconds=0,
+        )
+        now = MONDAY_TARGET - timedelta(seconds=60)
+        waiting = self.engine.evaluate(
+            item,
+            context(
+                now,
+                idle_seconds=10 * 60,
+                idle_reliable=True,
+                cpu_usage=5.0,
+                cpu_reliable=True,
+                cpu_status="cpu_sample_available",
+            ),
+        )
+        ready = self.engine.evaluate(
+            item,
+            context(
+                now,
+                idle_seconds=30 * 60,
+                idle_reliable=True,
+                cpu_usage=5.0,
+                cpu_reliable=True,
+                cpu_status="cpu_sample_available",
+            ),
+        )
+
+        self.assertFalse(waiting.ready_for_countdown)
+        self.assertTrue(waiting.for_type("cpu").satisfied)
+        self.assertFalse(waiting.for_type("idle").satisfied)
+        self.assertTrue(ready.ready_for_countdown)
+
     def test_pending_time_and_idle_keeps_original_scheduled_target(self):
         item = occurrence()
         waiting = self.engine.evaluate(
