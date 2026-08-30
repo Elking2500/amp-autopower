@@ -49,7 +49,7 @@ from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QPushButton, QProgressDialog, QScrollArea, QSpinBox, QSystemTrayIcon, QTabWidget,
+    QPushButton, QProgressDialog, QSpinBox, QSystemTrayIcon, QTabWidget,
     QTimeEdit, QVBoxLayout, QWidget,
 )
 from PySide6.QtCore import QTime
@@ -856,18 +856,12 @@ class ScheduleEditor(QDialog):
     def __init__(self, parent=None, schedule=None, use_24_hour=None):
         super().__init__(parent)
         self.setWindowTitle("Editar programación")
-        self.resize(610, 680)
+        self.resize(720, 610)
+        self.setMinimumSize(660, 520)
         self.original = schedule
         s = schedule or Schedule()
 
         outer = QVBoxLayout(self)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        content = QWidget()
-        root = QVBoxLayout(content)
-        scroll.setWidget(content)
-        outer.addWidget(scroll)
-        form = QFormLayout()
 
         self.name = QLineEdit(s.name)
 
@@ -1065,34 +1059,6 @@ class ScheduleEditor(QDialog):
             getattr(s, "close_apps_first", True)
         )
 
-        form.addRow("Nombre:", self.name)
-        form.addRow("Estado:", self.enabled)
-        form.addRow("Modo:", self.mode)
-        form.addRow("Hora:", self.time)
-        form.addRow("Duración:", interval_row)
-        form.addRow("Acción:", self.action)
-        form.addRow("Cuenta regresiva final:", self.countdown)
-        form.addRow(self.condition_logic_label, self.condition_logic)
-        form.addRow("Inactividad:", self.require_idle)
-        form.addRow("Tiempo mínimo inactivo:", self.idle_minutes)
-        form.addRow("CPU:", self.require_cpu)
-        form.addRow("Comparación CPU:", self.cpu_comparison)
-        form.addRow("Umbral CPU:", self.cpu_threshold)
-        form.addRow("Duración continua CPU:", self.cpu_duration)
-        form.addRow("Promedio CPU:", self.cpu_use_average)
-        form.addRow("Ventana del promedio:", self.cpu_average)
-        form.addRow("Red:", self.require_network)
-        form.addRow("Interfaz:", self.network_interface)
-        form.addRow("Dirección:", self.network_direction)
-        form.addRow("Comparación de red:", self.network_comparison)
-        form.addRow("Umbral de red:", network_threshold_row)
-        form.addRow("Duración continua de red:", self.network_duration)
-        form.addRow("Promedio de red:", self.network_use_average)
-        form.addRow("Ventana de red:", self.network_average)
-        form.addRow("Cierre seguro:", self.close_apps)
-
-        root.addLayout(form)
-
         days_box = QGroupBox("Días de la semana")
         days_layout = QGridLayout(days_box)
 
@@ -1103,7 +1069,6 @@ class ScheduleEditor(QDialog):
             self.days.append(c)
             days_layout.addWidget(c, i // 4, i % 4)
 
-        root.addWidget(days_box)
         self.days_box = days_box
 
         self.warn_box = QGroupBox("Avisos previos para horario programado")
@@ -1123,26 +1088,98 @@ class ScheduleEditor(QDialog):
             w.setChecked(val in s.warning_minutes)
             warn_layout.addWidget(w)
 
-        root.addWidget(self.warn_box)
-
-        note = QLabel(
+        scheduling_note = QLabel(
             "El modo Intervalo comienza al guardar y se ejecuta una sola vez. "
             "Al completarse queda desactivado; editarlo o reactivarlo inicia "
             "un intervalo nuevo. Los días no se aplican a Intervalo.\n\n"
             "En Solo inactividad, la acción puede ejecutarse a cualquier hora "
-            "de los días seleccionados y la inactividad es obligatoria.\n\n"
-            "El cierre seguro de aplicaciones se usa para Apagar y Reiniciar "
-            "mediante la sesión de Plasma, evitando matar los programas a la fuerza."
+            "de los días seleccionados y la inactividad es obligatoria."
         )
-        note.setWordWrap(True)
-        root.addWidget(note)
+        scheduling_note.setWordWrap(True)
+
+        action_note = QLabel(
+            "El cierre seguro de aplicaciones se usa para Apagar y Reiniciar "
+            "mediante la sesión de Plasma, evitando matar los programas a la "
+            "fuerza. Las opciones avanzadas previas a la acción se añadirán "
+            "en esta pestaña en una fase futura."
+        )
+        action_note.setWordWrap(True)
+
+        self.tabs = QTabWidget()
+        outer.addWidget(self.tabs, 1)
+
+        general_tab = QWidget()
+        general_form = QFormLayout(general_tab)
+        general_form.addRow("Nombre:", self.name)
+        general_form.addRow("Estado:", self.enabled)
+        general_form.addRow("Acción:", self.action)
+        general_form.addRow("Cuenta regresiva final:", self.countdown)
+        general_form.addRow(self.condition_logic_label, self.condition_logic)
+        general_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.tabs.addTab(general_tab, "General")
+
+        scheduling_tab = QWidget()
+        scheduling_layout = QVBoxLayout(scheduling_tab)
+        scheduling_form = QFormLayout()
+        scheduling_form.addRow("Modo:", self.mode)
+        scheduling_form.addRow("Hora:", self.time)
+        scheduling_form.addRow("Duración:", interval_row)
+        scheduling_form.setFieldGrowthPolicy(
+            QFormLayout.AllNonFixedFieldsGrow
+        )
+        scheduling_layout.addLayout(scheduling_form)
+        scheduling_layout.addWidget(self.days_box)
+        scheduling_layout.addWidget(self.warn_box)
+        scheduling_layout.addWidget(scheduling_note)
+        scheduling_layout.addStretch()
+        self.tabs.addTab(scheduling_tab, "Programación")
+
+        idle_tab = QWidget()
+        idle_form = QFormLayout(idle_tab)
+        idle_form.addRow("Inactividad:", self.require_idle)
+        idle_form.addRow("Tiempo mínimo inactivo:", self.idle_minutes)
+        idle_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.tabs.addTab(idle_tab, "Inactividad")
+
+        cpu_tab = QWidget()
+        cpu_form = QFormLayout(cpu_tab)
+        cpu_form.addRow("CPU:", self.require_cpu)
+        cpu_form.addRow("Comparación:", self.cpu_comparison)
+        cpu_form.addRow("Umbral:", self.cpu_threshold)
+        cpu_form.addRow("Duración continua:", self.cpu_duration)
+        cpu_form.addRow("Promedio:", self.cpu_use_average)
+        cpu_form.addRow("Ventana del promedio:", self.cpu_average)
+        cpu_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.tabs.addTab(cpu_tab, "CPU")
+
+        network_tab = QWidget()
+        network_form = QFormLayout(network_tab)
+        network_form.addRow("Red:", self.require_network)
+        network_form.addRow("Interfaz:", self.network_interface)
+        network_form.addRow("Dirección:", self.network_direction)
+        network_form.addRow("Comparación:", self.network_comparison)
+        network_form.addRow("Umbral:", network_threshold_row)
+        network_form.addRow("Duración continua:", self.network_duration)
+        network_form.addRow("Promedio:", self.network_use_average)
+        network_form.addRow("Ventana del promedio:", self.network_average)
+        network_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.tabs.addTab(network_tab, "Red")
+
+        action_tab = QWidget()
+        action_layout = QVBoxLayout(action_tab)
+        action_form = QFormLayout()
+        action_form.addRow("Cierre seguro:", self.close_apps)
+        action_layout.addLayout(action_form)
+        action_layout.addWidget(action_note)
+        action_layout.addStretch()
+        self.tabs.addTab(action_tab, "Acción")
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.Save | QDialogButtonBox.Cancel
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
+        outer.addWidget(buttons)
 
         self.mode.currentIndexChanged.connect(self._refresh_mode_controls)
         self.require_idle.toggled.connect(self._refresh_mode_controls)
