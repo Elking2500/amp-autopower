@@ -4,6 +4,7 @@
 
 - Preparación interna de un motor extensible de condiciones.
 - Las condiciones existentes de hora e inactividad se evalúan mediante la nueva capa sin cambiar la configuración ni la interfaz de v1.3.0.
+- Soporte en desarrollo para programaciones one-shot basadas en intervalo.
 
 ## 1.3.0
 

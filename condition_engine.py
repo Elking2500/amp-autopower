@@ -4,6 +4,20 @@ from typing import Any, Dict, Optional, Tuple
 
 
 CONDITION_TYPES = ("time", "date", "interval", "idle", "cpu", "network")
+TRIGGER_MODES = ("time", "interval", "idle")
+
+
+def schedule_trigger_mode(schedule) -> str:
+    if isinstance(schedule, dict):
+        mode = str(schedule.get("trigger_mode", "")).lower()
+        use_time = schedule.get("use_time", True)
+    else:
+        mode = str(getattr(schedule, "trigger_mode", "")).lower()
+        use_time = getattr(schedule, "use_time", True)
+
+    if mode in TRIGGER_MODES:
+        return mode
+    return "time" if bool(use_time) else "idle"
 
 
 @dataclass(frozen=True)
@@ -14,6 +28,9 @@ class ScheduledOccurrence:
     armed: bool = False
     next_check_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
+    trigger_type: str = "time"
+    start_at: Optional[datetime] = None
+    duration_seconds: Optional[int] = None
 
     @classmethod
     def create(
@@ -30,6 +47,29 @@ class ScheduledOccurrence:
                 seconds=max(0, int(countdown_seconds))
             ),
             created_at=created_at,
+            trigger_type="time",
+        )
+
+    @classmethod
+    def create_interval(
+        cls,
+        schedule_id: str,
+        start_at: datetime,
+        duration_minutes: int,
+        countdown_seconds: int,
+    ):
+        duration_seconds = max(60, int(duration_minutes) * 60)
+        scheduled_target = start_at + timedelta(seconds=duration_seconds)
+        return cls(
+            schedule_id=schedule_id,
+            scheduled_target=scheduled_target,
+            countdown_start=scheduled_target - timedelta(
+                seconds=max(0, int(countdown_seconds))
+            ),
+            created_at=start_at,
+            trigger_type="interval",
+            start_at=start_at,
+            duration_seconds=duration_seconds,
         )
 
     @classmethod
@@ -53,6 +93,17 @@ class ScheduledOccurrence:
                 if created_raw
                 else None
             ),
+            trigger_type=str(data.get("trigger_type", "time")),
+            start_at=(
+                datetime.fromisoformat(data["start_at"])
+                if data.get("start_at")
+                else None
+            ),
+            duration_seconds=(
+                int(data["duration_seconds"])
+                if data.get("duration_seconds") is not None
+                else None
+            ),
         )
 
     def to_state(self) -> Dict[str, Any]:
@@ -66,6 +117,9 @@ class ScheduledOccurrence:
                 else None
             ),
             "created_at": self.created_at.isoformat() if self.created_at else None,
+            "trigger_type": self.trigger_type,
+            "start_at": self.start_at.isoformat() if self.start_at else None,
+            "duration_seconds": self.duration_seconds,
         }
 
     def mark_armed(self):
@@ -147,7 +201,7 @@ class TimeCondition(Condition):
             return self.disabled_result()
 
         occurrence = context.occurrence
-        if occurrence is None:
+        if occurrence is None or occurrence.trigger_type != "time":
             return ConditionResult(
                 condition_type=self.condition_type,
                 enabled=True,
@@ -176,6 +230,52 @@ class TimeCondition(Condition):
             satisfied_since=scheduled_target if satisfied else None,
             satisfied_for_seconds=satisfied_for,
             reason="trigger_reached" if satisfied else "waiting_for_time",
+        )
+
+
+class IntervalCondition(Condition):
+    condition_type = "interval"
+
+    def evaluate(self, context: ConditionContext) -> ConditionResult:
+        if not self.enabled:
+            return self.disabled_result()
+
+        occurrence = context.occurrence
+        if (
+            occurrence is None
+            or occurrence.trigger_type != "interval"
+            or occurrence.start_at is None
+            or occurrence.duration_seconds is None
+        ):
+            return ConditionResult(
+                condition_type=self.condition_type,
+                enabled=True,
+                satisfied=False,
+                reason="missing_interval_occurrence",
+            )
+
+        scheduled_target = occurrence.scheduled_target
+        satisfied = context.now >= scheduled_target
+        satisfied_for = None
+
+        if satisfied:
+            satisfied_for = max(
+                0.0,
+                (context.now - scheduled_target).total_seconds(),
+            )
+
+        return ConditionResult(
+            condition_type=self.condition_type,
+            enabled=True,
+            satisfied=satisfied,
+            info={
+                "start_at": occurrence.start_at,
+                "duration_seconds": occurrence.duration_seconds,
+                "scheduled_target": scheduled_target,
+            },
+            satisfied_since=scheduled_target if satisfied else None,
+            satisfied_for_seconds=satisfied_for,
+            reason="interval_elapsed" if satisfied else "waiting_for_interval",
         )
 
 
@@ -261,18 +361,22 @@ class ConditionEngine:
         self.runtime = ConditionRuntimeState()
 
     def conditions_for(self, schedule) -> Tuple[Condition, ...]:
-        use_time = bool(getattr(schedule, "use_time", True))
-        idle_enabled = bool(getattr(schedule, "require_idle", False)) or not use_time
+        trigger_mode = schedule_trigger_mode(schedule)
+        idle_enabled = (
+            bool(getattr(schedule, "require_idle", False))
+            or trigger_mode == "idle"
+        )
         idle_minutes = int(getattr(schedule, "idle_minutes", 30))
 
         # El modo solo-inactividad de v1.3.0 siempre aplica un mínimo seguro
         # de un minuto. El modo con hora conserva literalmente su umbral.
         idle_seconds = idle_minutes * 60
-        if not use_time:
+        if trigger_mode == "idle":
             idle_seconds = max(60, idle_seconds)
 
         return (
-            TimeCondition(enabled=use_time),
+            TimeCondition(enabled=trigger_mode == "time"),
+            IntervalCondition(enabled=trigger_mode == "interval"),
             IdleCondition(idle_seconds, enabled=idle_enabled),
         )
 
@@ -285,32 +389,35 @@ class ConditionEngine:
             condition.evaluate(context)
             for condition in self.conditions_for(schedule)
         )
-        non_time_results = tuple(
+        non_temporal_results = tuple(
             result
             for result in results
-            if result.enabled and result.condition_type != "time"
+            if (
+                result.enabled
+                and result.condition_type not in ("time", "interval")
+            )
         )
         logic = str(getattr(schedule, "condition_logic", "AND")).upper()
 
         if logic not in ("AND", "OR"):
             logic = "AND"
 
-        if not non_time_results:
+        if not non_temporal_results:
             other_conditions_ready = True
         elif logic == "OR":
             other_conditions_ready = any(
-                result.satisfied for result in non_time_results
+                result.satisfied for result in non_temporal_results
             )
         else:
             other_conditions_ready = all(
-                result.satisfied for result in non_time_results
+                result.satisfied for result in non_temporal_results
             )
 
-        use_time = bool(getattr(schedule, "use_time", True))
+        trigger_mode = schedule_trigger_mode(schedule)
         weekdays = getattr(schedule, "weekdays", ())
         occurrence = context.occurrence
 
-        if use_time:
+        if trigger_mode in ("time", "interval"):
             scheduled_target = (
                 occurrence.scheduled_target if occurrence else None
             )
@@ -321,6 +428,8 @@ class ConditionEngine:
             weekday_allowed = bool(
                 occurrence
                 and (
+                    trigger_mode == "interval"
+                    or
                     context.occurrence_pending
                     or scheduled_target.weekday() in weekdays
                 )
@@ -328,12 +437,12 @@ class ConditionEngine:
             countdown_due = bool(
                 countdown_start and context.now >= countdown_start
             )
-            time_result = next(
+            temporal_result = next(
                 result
                 for result in results
-                if result.condition_type == "time"
+                if result.condition_type == trigger_mode
             )
-            trigger_reached = time_result.satisfied
+            trigger_reached = temporal_result.satisfied
             armed = bool(occurrence and occurrence.armed) or trigger_reached
             ready_for_countdown = (
                 weekday_allowed

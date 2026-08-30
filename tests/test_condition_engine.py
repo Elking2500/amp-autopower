@@ -25,6 +25,16 @@ def schedule(**overrides):
     return SimpleNamespace(**values)
 
 
+def interval_schedule(**overrides):
+    return schedule(
+        use_time=False,
+        trigger_mode="interval",
+        interval_minutes=30,
+        weekdays=[],
+        **overrides,
+    )
+
+
 def occurrence(target=MONDAY_TARGET, **overrides):
     item = ScheduledOccurrence.create(
         "schedule-1",
@@ -86,6 +96,172 @@ class ConditionEngineTests(unittest.TestCase):
             reached.for_type("time").satisfied_since,
             MONDAY_TARGET,
         )
+
+    def test_interval_target_is_start_plus_duration(self):
+        start_at = datetime(2026, 8, 31, 10, 0)
+        item = ScheduledOccurrence.create_interval(
+            "schedule-1",
+            start_at,
+            30,
+            60,
+        )
+
+        self.assertEqual(item.start_at, start_at)
+        self.assertEqual(item.duration_seconds, 30 * 60)
+        self.assertEqual(
+            item.scheduled_target,
+            datetime(2026, 8, 31, 10, 30),
+        )
+
+    def test_interval_countdown_precedes_condition_satisfaction(self):
+        start_at = datetime(2026, 8, 31, 10, 0)
+        item = ScheduledOccurrence.create_interval(
+            "schedule-1",
+            start_at,
+            30,
+            60,
+        )
+        result = self.engine.evaluate(
+            interval_schedule(),
+            ConditionContext(
+                now=datetime(2026, 8, 31, 10, 29),
+                occurrence=item,
+                occurrence_pending=True,
+            ),
+        )
+
+        self.assertTrue(result.countdown_due)
+        self.assertTrue(result.ready_for_countdown)
+        self.assertFalse(result.trigger_reached)
+        self.assertFalse(result.for_type("interval").satisfied)
+        self.assertEqual(
+            result.countdown_start,
+            datetime(2026, 8, 31, 10, 29),
+        )
+
+    def test_time_condition_rejects_interval_occurrence(self):
+        item = ScheduledOccurrence.create_interval(
+            "schedule-1",
+            datetime(2026, 8, 31, 10, 0),
+            30,
+            60,
+        )
+        result = self.engine.evaluate(
+            schedule(),
+            ConditionContext(
+                now=datetime(2026, 8, 31, 10, 30),
+                occurrence=item,
+                occurrence_pending=True,
+            ),
+        )
+
+        self.assertFalse(result.for_type("time").satisfied)
+        self.assertFalse(result.trigger_reached)
+
+    def test_interval_occurrence_round_trip_preserves_start_and_target(self):
+        start_at = datetime(2026, 8, 31, 10, 0)
+        original = ScheduledOccurrence.create_interval(
+            "schedule-1",
+            start_at,
+            30,
+            60,
+        )
+
+        restored = ScheduledOccurrence.from_state(
+            original.schedule_id,
+            original.to_state(),
+        )
+
+        self.assertEqual(restored, original)
+        self.assertEqual(restored.start_at, start_at)
+        self.assertEqual(
+            restored.scheduled_target,
+            datetime(2026, 8, 31, 10, 30),
+        )
+
+    def test_interval_and_idle_can_start_countdown_before_target(self):
+        start_at = datetime(2026, 8, 31, 10, 0)
+        item = ScheduledOccurrence.create_interval(
+            "schedule-1",
+            start_at,
+            30,
+            60,
+        )
+        result = self.engine.evaluate(
+            interval_schedule(require_idle=True),
+            ConditionContext(
+                now=datetime(2026, 8, 31, 10, 29),
+                occurrence=item,
+                occurrence_pending=True,
+                idle_seconds=30 * 60,
+                idle_reliable=True,
+            ),
+        )
+
+        self.assertTrue(result.ready_for_countdown)
+        self.assertFalse(result.for_type("interval").satisfied)
+        self.assertTrue(result.for_type("idle").satisfied)
+
+    def test_interval_and_idle_pending_keeps_original_target(self):
+        start_at = datetime(2026, 8, 31, 10, 0)
+        target = datetime(2026, 8, 31, 10, 30)
+        item = ScheduledOccurrence.create_interval(
+            "schedule-1",
+            start_at,
+            30,
+            60,
+        ).mark_armed()
+        waiting = self.engine.evaluate(
+            interval_schedule(require_idle=True),
+            ConditionContext(
+                now=target,
+                occurrence=item,
+                occurrence_pending=True,
+                idle_seconds=10 * 60,
+                idle_reliable=True,
+            ),
+        )
+        ready = self.engine.evaluate(
+            interval_schedule(require_idle=True),
+            ConditionContext(
+                now=target + timedelta(minutes=20),
+                occurrence=item,
+                occurrence_pending=True,
+                idle_seconds=30 * 60,
+                idle_reliable=True,
+            ),
+        )
+
+        self.assertTrue(waiting.pending)
+        self.assertFalse(waiting.ready_for_countdown)
+        self.assertEqual(waiting.scheduled_target, target)
+        self.assertTrue(ready.ready_for_countdown)
+        self.assertEqual(ready.scheduled_target, target)
+
+    def test_interval_pending_can_cross_midnight(self):
+        start_at = datetime(2026, 9, 4, 23, 0)
+        target = datetime(2026, 9, 4, 23, 30)
+        ready_at = datetime(2026, 9, 5, 0, 10)
+        item = ScheduledOccurrence.create_interval(
+            "schedule-1",
+            start_at,
+            30,
+            60,
+        ).mark_armed().with_next_check(ready_at)
+        result = self.engine.evaluate(
+            interval_schedule(require_idle=True),
+            ConditionContext(
+                now=ready_at,
+                occurrence=item,
+                occurrence_pending=True,
+                idle_seconds=30 * 60,
+                idle_reliable=True,
+            ),
+        )
+
+        self.assertTrue(result.ready_for_countdown)
+        self.assertEqual(result.scheduled_target, target)
+        self.assertEqual(result.for_type("interval").info["start_at"], start_at)
 
     def test_pending_time_and_idle_keeps_original_scheduled_target(self):
         item = occurrence()

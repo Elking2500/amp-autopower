@@ -4,8 +4,12 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from amp_autopower import MainWindow, Schedule
-from condition_engine import ConditionEngine, ScheduledOccurrence
+from amp_autopower import MainWindow, Schedule, schedule_to_dict
+from condition_engine import (
+    ConditionEngine,
+    ScheduledOccurrence,
+    schedule_trigger_mode,
+)
 
 
 class SchedulerHarness:
@@ -13,16 +17,28 @@ class SchedulerHarness:
     save_pending_occurrence = MainWindow.save_pending_occurrence
     pending_action_time = MainWindow.pending_action_time
     _prune_pending_occurrences = MainWindow._prune_pending_occurrences
+    _reconcile_schedule_occurrences = MainWindow._reconcile_schedule_occurrences
+    _start_interval_occurrence = MainWindow._start_interval_occurrence
+    _complete_interval_schedule = MainWindow._complete_interval_schedule
+    _record_action_completion = MainWindow._record_action_completion
+    _guard_interval_execution = MainWindow._guard_interval_execution
+    _restore_failed_interval_execution = MainWindow._restore_failed_interval_execution
+    execute_action = MainWindow.execute_action
     evaluate_conditions = MainWindow.evaluate_conditions
     defer_for_idle = MainWindow.defer_for_idle
     _has_active_dialog_for_schedule = MainWindow._has_active_dialog_for_schedule
     _pending_occurrence_tick = MainWindow._pending_occurrence_tick
+    set_schedules = MainWindow.set_schedules
+    mark_skipped = MainWindow.mark_skipped
 
     def __init__(self, state, idle_seconds=0, reliable=True):
         self.state = state
         self.condition_engine = ConditionEngine()
         self.active_dialogs = {}
-        self.config = {"overlay_all_schedule_warnings": False}
+        self.config = {
+            "overlay_all_schedule_warnings": False,
+            "schedules": [],
+        }
         self._idle_seconds = idle_seconds
         self._reliable = reliable
         self.started = []
@@ -41,6 +57,12 @@ class SchedulerHarness:
 
     def start_final_countdown(self, schedule, target, seconds, key):
         self.started.append((schedule.id, target, seconds, key))
+
+    def schedules(self):
+        return [Schedule(**raw) for raw in self.config.get("schedules", [])]
+
+    def refresh_list(self):
+        pass
 
 
 class SchedulerCompatibilityTests(unittest.TestCase):
@@ -62,7 +84,536 @@ class SchedulerCompatibilityTests(unittest.TestCase):
 
         loaded = Schedule(**raw)
 
-        self.assertEqual(asdict(loaded), raw)
+        loaded_data = asdict(loaded)
+        for key, value in raw.items():
+            self.assertEqual(loaded_data[key], value)
+        self.assertEqual(schedule_trigger_mode(loaded), "time")
+        self.assertEqual(loaded.interval_minutes, 60)
+
+    def test_legacy_modes_serialize_without_interval_fields(self):
+        timed = Schedule(id="timed", use_time=True, trigger_mode="time")
+        idle = Schedule(id="idle", use_time=False, trigger_mode="idle")
+
+        for item in (timed, idle):
+            serialized = schedule_to_dict(item)
+            self.assertNotIn("trigger_mode", serialized)
+            self.assertNotIn("interval_minutes", serialized)
+
+    def test_switching_interval_to_time_discards_interval_occurrence(self):
+        interval = Schedule(
+            id="schedule",
+            use_time=False,
+            trigger_mode="interval",
+            weekdays=[],
+        )
+        timed = Schedule(
+            id="schedule",
+            use_time=True,
+            trigger_mode="time",
+            weekdays=[0],
+        )
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {
+                interval.id: ScheduledOccurrence.create_interval(
+                    interval.id,
+                    datetime(2026, 8, 31, 10, 0),
+                    30,
+                    60,
+                ).to_state(),
+            },
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+
+        with patch("amp_autopower.save_json"):
+            harness._prune_pending_occurrences([timed])
+
+        self.assertNotIn(interval.id, state["pending_occurrences"])
+
+    def test_editing_active_interval_cancels_old_countdown_before_restart(self):
+        saved_at = datetime(2026, 8, 31, 10, 15)
+        target = datetime(2026, 8, 31, 10, 30)
+        original = Schedule(
+            id="interval",
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=30,
+            weekdays=[],
+            action="reboot",
+        )
+        updated = Schedule(
+            id="interval",
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=90,
+            weekdays=[],
+            action="test",
+        )
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {
+                original.id: ScheduledOccurrence.create_interval(
+                    original.id,
+                    datetime(2026, 8, 31, 10, 0),
+                    30,
+                    60,
+                ).to_state(),
+            },
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        harness.config["schedules"] = [schedule_to_dict(original)]
+
+        class Dialog:
+            schedule = original
+            remaining = 30
+            finished_with = None
+
+            def finish(self, action):
+                self.finished_with = action
+                harness.mark_skipped(original, target)
+
+        dialog = Dialog()
+        harness.active_dialogs["old"] = dialog
+
+        with patch("amp_autopower.save_json"):
+            harness.set_schedules(
+                [updated],
+                restart_interval_ids={updated.id},
+                now=saved_at,
+            )
+
+        restarted = harness.pending_occurrence(updated)
+        self.assertEqual(dialog.finished_with, "cancel")
+        self.assertEqual(restarted.start_at, saved_at)
+        self.assertEqual(
+            restarted.scheduled_target,
+            saved_at + timedelta(minutes=90),
+        )
+        self.assertTrue(harness.schedules()[0].enabled)
+        self.assertEqual(harness.schedules()[0].action, "test")
+
+    def test_interval_reconcile_persists_start_and_target(self):
+        start_at = datetime(2026, 8, 31, 10, 0)
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        item = Schedule(
+            id="interval",
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=30,
+            weekdays=[],
+        )
+        harness = SchedulerHarness(state)
+
+        with patch("amp_autopower.save_json"):
+            harness._reconcile_schedule_occurrences(
+                [item],
+                restart_interval_ids={item.id},
+                now=start_at,
+            )
+
+        occurrence = harness.pending_occurrence(item)
+        self.assertEqual(occurrence.start_at, start_at)
+        self.assertEqual(
+            occurrence.scheduled_target,
+            datetime(2026, 8, 31, 10, 30),
+        )
+
+    def test_interval_user_snooze_does_not_replace_original_target(self):
+        start_at = datetime(2026, 8, 31, 10, 0)
+        target = datetime(2026, 8, 31, 10, 30)
+        snooze = datetime(2026, 8, 31, 10, 40)
+        occurrence = ScheduledOccurrence.create_interval(
+            "interval",
+            start_at,
+            30,
+            60,
+        ).mark_armed()
+        state = {
+            "last_runs": {},
+            "snoozes": {"interval": snooze.isoformat()},
+            "skipped_targets": {},
+            "pending_occurrences": {
+                "interval": occurrence.to_state(),
+            },
+            "completed_intervals": {},
+        }
+        item = Schedule(
+            id="interval",
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=30,
+            weekdays=[],
+        )
+        harness = SchedulerHarness(state)
+
+        with patch("amp_autopower.save_json"):
+            harness._pending_occurrence_tick(
+                item,
+                occurrence,
+                snooze - timedelta(seconds=60),
+            )
+
+        restored = harness.pending_occurrence(item)
+        self.assertEqual(restored.start_at, start_at)
+        self.assertEqual(restored.scheduled_target, target)
+        self.assertEqual(harness.started[0][1], target)
+
+    def test_disabling_interval_removes_active_occurrence(self):
+        start_at = datetime(2026, 8, 31, 10, 0)
+        active = Schedule(
+            id="interval",
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=30,
+            weekdays=[],
+        )
+        disabled = Schedule(**{**asdict(active), "enabled": False})
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {
+                active.id: ScheduledOccurrence.create_interval(
+                    active.id,
+                    start_at,
+                    30,
+                    60,
+                ).to_state(),
+            },
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+
+        with patch("amp_autopower.save_json"):
+            harness._reconcile_schedule_occurrences([disabled], now=start_at)
+
+        self.assertNotIn(active.id, state["pending_occurrences"])
+
+    def test_reactivating_interval_creates_new_start(self):
+        reactivated_at = datetime(2026, 8, 31, 12, 0)
+        item = Schedule(
+            id="interval",
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=45,
+            weekdays=[],
+        )
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {item.id: "completed"},
+        }
+        harness = SchedulerHarness(state)
+
+        with patch("amp_autopower.save_json"):
+            harness._reconcile_schedule_occurrences(
+                [item],
+                restart_interval_ids={item.id},
+                now=reactivated_at,
+            )
+
+        occurrence = harness.pending_occurrence(item)
+        self.assertEqual(occurrence.start_at, reactivated_at)
+        self.assertEqual(
+            occurrence.scheduled_target,
+            reactivated_at + timedelta(minutes=45),
+        )
+        self.assertNotIn(item.id, state["completed_intervals"])
+
+    def test_editing_interval_duration_restarts_from_save_time(self):
+        original_start = datetime(2026, 8, 31, 10, 0)
+        saved_at = datetime(2026, 8, 31, 10, 30)
+        item = Schedule(
+            id="interval",
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=180,
+            weekdays=[],
+        )
+        old_occurrence = ScheduledOccurrence.create_interval(
+            item.id,
+            original_start,
+            120,
+            60,
+        )
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {
+                item.id: old_occurrence.to_state(),
+            },
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+
+        with patch("amp_autopower.save_json"):
+            harness._reconcile_schedule_occurrences(
+                [item],
+                restart_interval_ids={item.id},
+                now=saved_at,
+            )
+
+        occurrence = harness.pending_occurrence(item)
+        self.assertEqual(occurrence.start_at, saved_at)
+        self.assertEqual(
+            occurrence.scheduled_target,
+            saved_at + timedelta(hours=3),
+        )
+
+    def test_deleting_interval_cleans_all_associated_state(self):
+        item = Schedule(
+            id="interval",
+            use_time=False,
+            trigger_mode="interval",
+            weekdays=[],
+        )
+        target = datetime(2026, 8, 31, 11, 0)
+        state = {
+            "last_runs": {item.id: "run"},
+            "snoozes": {item.id: "snooze"},
+            "skipped_targets": {item.id: "skipped"},
+            "pending_occurrences": {
+                item.id: ScheduledOccurrence.create_interval(
+                    item.id,
+                    datetime(2026, 8, 31, 10, 0),
+                    60,
+                    60,
+                ).to_state(),
+            },
+            "completed_intervals": {item.id: target.isoformat()},
+        }
+        harness = SchedulerHarness(state)
+        harness.config["schedules"] = [asdict(item)]
+
+        with patch("amp_autopower.save_json"):
+            harness.set_schedules([], now=target)
+
+        for state_key in (
+            "last_runs",
+            "snoozes",
+            "skipped_targets",
+            "pending_occurrences",
+            "completed_intervals",
+        ):
+            self.assertNotIn(item.id, state[state_key])
+
+    def test_completed_interval_is_disabled_and_not_restarted(self):
+        item = Schedule(
+            id="interval",
+            use_time=False,
+            trigger_mode="interval",
+            weekdays=[],
+        )
+        target = datetime(2026, 8, 31, 11, 0)
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {
+                item.id: ScheduledOccurrence.create_interval(
+                    item.id,
+                    datetime(2026, 8, 31, 10, 0),
+                    60,
+                    60,
+                ).to_state(),
+            },
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        harness.config["schedules"] = [asdict(item)]
+
+        with patch("amp_autopower.save_json"):
+            harness.mark_skipped(item, target)
+            configured = harness.schedules()[0]
+            harness._reconcile_schedule_occurrences([configured], now=target)
+
+        self.assertFalse(configured.enabled)
+        self.assertNotIn(item.id, state["pending_occurrences"])
+        self.assertIn(item.id, state["completed_intervals"])
+
+    def test_successful_interval_action_completes_one_shot(self):
+        item = Schedule(
+            id="interval",
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=60,
+            weekdays=[],
+            action="suspend",
+            close_apps_first=False,
+        )
+        target = datetime(2026, 8, 31, 11, 0)
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {
+                item.id: ScheduledOccurrence.create_interval(
+                    item.id,
+                    datetime(2026, 8, 31, 10, 0),
+                    60,
+                    60,
+                ).to_state(),
+            },
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        harness.config["schedules"] = [schedule_to_dict(item)]
+        success = SimpleNamespace(returncode=0, stderr="", stdout="")
+
+        def successful_command(_cmd):
+            self.assertFalse(harness.schedules()[0].enabled)
+            self.assertIn(item.id, state["completed_intervals"])
+            return success
+
+        with (
+            patch("amp_autopower.save_json"),
+            patch("amp_autopower.run_cmd", side_effect=successful_command),
+        ):
+            harness.execute_action(item, target)
+
+        self.assertFalse(harness.schedules()[0].enabled)
+        self.assertEqual(state["last_runs"][item.id], target.isoformat())
+        self.assertIn(item.id, state["completed_intervals"])
+        self.assertNotIn(item.id, state["pending_occurrences"])
+
+    def test_failed_interval_action_remains_active(self):
+        item = Schedule(
+            id="interval",
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=60,
+            weekdays=[],
+            action="suspend",
+            close_apps_first=False,
+        )
+        target = datetime(2026, 8, 31, 11, 0)
+        occurrence = ScheduledOccurrence.create_interval(
+            item.id,
+            datetime(2026, 8, 31, 10, 0),
+            60,
+            60,
+        )
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {item.id: occurrence.to_state()},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        harness.config["schedules"] = [schedule_to_dict(item)]
+        failure = SimpleNamespace(
+            returncode=1,
+            stderr="simulated failure",
+            stdout="",
+        )
+
+        with (
+            patch("amp_autopower.save_json"),
+            patch("amp_autopower.run_cmd", return_value=failure),
+        ):
+            harness.execute_action(item, target)
+
+        self.assertTrue(harness.schedules()[0].enabled)
+        self.assertNotIn(item.id, state["last_runs"])
+        self.assertNotIn(item.id, state["completed_intervals"])
+        self.assertIn(item.id, state["pending_occurrences"])
+
+    def test_interval_command_exception_restores_active_occurrence(self):
+        item = Schedule(
+            id="interval",
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=60,
+            weekdays=[],
+            action="suspend",
+            close_apps_first=False,
+        )
+        target = datetime(2026, 8, 31, 11, 0)
+        occurrence = ScheduledOccurrence.create_interval(
+            item.id,
+            datetime(2026, 8, 31, 10, 0),
+            60,
+            60,
+        )
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {item.id: occurrence.to_state()},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        harness.config["schedules"] = [schedule_to_dict(item)]
+
+        with (
+            patch("amp_autopower.save_json"),
+            patch("amp_autopower.run_cmd", side_effect=OSError("simulated")),
+        ):
+            harness.execute_action(item, target)
+
+        self.assertTrue(harness.schedules()[0].enabled)
+        self.assertNotIn(item.id, state["completed_intervals"])
+        self.assertIn(item.id, state["pending_occurrences"])
+
+    def test_multiple_intervals_keep_independent_occurrences(self):
+        start_at = datetime(2026, 8, 31, 10, 0)
+        first = Schedule(
+            id="first",
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=30,
+            weekdays=[],
+        )
+        second = Schedule(
+            id="second",
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=90,
+            weekdays=[],
+        )
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+
+        with patch("amp_autopower.save_json"):
+            harness._reconcile_schedule_occurrences(
+                [first, second],
+                restart_interval_ids={first.id, second.id},
+                now=start_at,
+            )
+
+        first_occurrence = harness.pending_occurrence(first)
+        second_occurrence = harness.pending_occurrence(second)
+        self.assertEqual(
+            first_occurrence.scheduled_target,
+            start_at + timedelta(minutes=30),
+        )
+        self.assertEqual(
+            second_occurrence.scheduled_target,
+            start_at + timedelta(minutes=90),
+        )
+        self.assertNotEqual(first_occurrence, second_occurrence)
 
     def test_pending_occurrence_survives_restart_and_uses_original_target(self):
         target = datetime(2026, 9, 4, 23, 30)

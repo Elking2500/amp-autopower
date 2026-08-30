@@ -20,7 +20,12 @@ from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from condition_engine import ConditionContext, ConditionEngine, ScheduledOccurrence
+from condition_engine import (
+    ConditionContext,
+    ConditionEngine,
+    ScheduledOccurrence,
+    schedule_trigger_mode,
+)
 from PySide6.QtCore import Qt, QTimer, QLockFile, QStandardPaths, QThread, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
@@ -61,6 +66,16 @@ ACTIONS = {
     "hibernate": "Hibernar",
     "test": "Solo aviso (prueba)",
 }
+
+
+def format_interval(minutes):
+    hours, remaining = divmod(max(1, int(minutes)), 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours} h")
+    if remaining:
+        parts.append(f"{remaining} min")
+    return " ".join(parts)
 
 
 def ensure_dirs():
@@ -177,6 +192,8 @@ class Schedule:
     name: str = "Apagado nocturno"
     enabled: bool = True
     use_time: bool = True
+    trigger_mode: str = ""
+    interval_minutes: int = 60
     time: str = "23:30"
     weekdays: list = field(default_factory=lambda: [0, 1, 2, 3, 4, 5, 6])
     action: str = "poweroff"
@@ -185,6 +202,14 @@ class Schedule:
     require_idle: bool = False
     idle_minutes: int = 30
     close_apps_first: bool = True
+
+
+def schedule_to_dict(schedule):
+    data = asdict(schedule)
+    if schedule_trigger_mode(schedule) != "interval":
+        data.pop("trigger_mode", None)
+        data.pop("interval_minutes", None)
+    return data
 
 
 DEFAULT_CONFIG = {
@@ -200,7 +225,7 @@ DEFAULT_CONFIG = {
     "update_interval_hours": 48,
     "update_manifest_url": CANONICAL_UPDATE_MANIFEST_URL,
     "notify_updates": True,
-    "schedules": [asdict(Schedule())],
+    "schedules": [schedule_to_dict(Schedule())],
 }
 
 DEFAULT_STATE = {
@@ -208,6 +233,7 @@ DEFAULT_STATE = {
     "snoozes": {},
     "skipped_targets": {},
     "pending_occurrences": {},
+    "completed_intervals": {},
     "last_update_check": None,
     "available_update": None,
 }
@@ -497,8 +523,13 @@ class OverlayPage(QWidget):
         lay = QVBoxLayout(card); lay.setContentsMargins(28,28,28,28)
         self.title = QLabel(); self.title.setAlignment(Qt.AlignCenter); self.title.setStyleSheet("font-size:34px;font-weight:900;")
         lay.addWidget(self.title)
-        if getattr(schedule, "use_time", True):
+        mode = schedule_trigger_mode(schedule)
+        if mode == "time":
             trigger_text = f"Hora programada: <b>{schedule.time}</b>"
+        elif mode == "interval":
+            trigger_text = (
+                f"Intervalo: <b>{format_interval(schedule.interval_minutes)}</b>"
+            )
         else:
             trigger_text = f"Activada tras <b>{schedule.idle_minutes} min de inactividad</b>"
         desc = QLabel(
@@ -564,7 +595,7 @@ class ScheduleEditor(QDialog):
     def __init__(self, parent=None, schedule=None):
         super().__init__(parent)
         self.setWindowTitle("Editar programación")
-        self.resize(590, 580)
+        self.resize(610, 630)
         self.original = schedule
         s = schedule or Schedule()
 
@@ -576,11 +607,31 @@ class ScheduleEditor(QDialog):
         self.enabled = QCheckBox("Activa")
         self.enabled.setChecked(s.enabled)
 
-        self.use_time = QCheckBox("Usar hora programada")
-        self.use_time.setChecked(getattr(s, "use_time", True))
+        self.mode = QComboBox()
+        self.mode.addItem("Hora programada", "time")
+        self.mode.addItem("Intervalo", "interval")
+        self.mode.addItem("Solo inactividad", "idle")
+        mode_index = self.mode.findData(schedule_trigger_mode(s))
+        self.mode.setCurrentIndex(max(0, mode_index))
 
         self.time = QTimeEdit(QTime.fromString(s.time, "HH:mm"))
         self.time.setDisplayFormat("HH:mm")
+
+        interval_minutes = max(1, int(getattr(s, "interval_minutes", 60)))
+        interval_hours, interval_remainder = divmod(interval_minutes, 60)
+        self.interval_hours = QSpinBox()
+        self.interval_hours.setRange(0, 168)
+        self.interval_hours.setSuffix(" h")
+        self.interval_hours.setValue(interval_hours)
+        self.interval_minutes = QSpinBox()
+        self.interval_minutes.setRange(0, 59)
+        self.interval_minutes.setSuffix(" min")
+        self.interval_minutes.setValue(interval_remainder)
+        self.interval_hours.valueChanged.connect(self._ensure_interval_duration)
+        self.interval_minutes.valueChanged.connect(self._ensure_interval_duration)
+        interval_row = QHBoxLayout()
+        interval_row.addWidget(self.interval_hours)
+        interval_row.addWidget(self.interval_minutes)
 
         self.action = QComboBox()
         for key, text in ACTIONS.items():
@@ -596,7 +647,7 @@ class ScheduleEditor(QDialog):
         self.require_idle = QCheckBox("Solo ejecutar cuando no haya actividad")
         self.require_idle.setChecked(
             getattr(s, "require_idle", False)
-            or not getattr(s, "use_time", True)
+            or schedule_trigger_mode(s) == "idle"
         )
 
         self.idle_minutes = QSpinBox()
@@ -615,8 +666,9 @@ class ScheduleEditor(QDialog):
 
         form.addRow("Nombre:", self.name)
         form.addRow("Estado:", self.enabled)
-        form.addRow("Horario:", self.use_time)
+        form.addRow("Modo:", self.mode)
         form.addRow("Hora:", self.time)
+        form.addRow("Duración:", interval_row)
         form.addRow("Acción:", self.action)
         form.addRow("Cuenta regresiva final:", self.countdown)
         form.addRow("Inactividad:", self.require_idle)
@@ -636,6 +688,7 @@ class ScheduleEditor(QDialog):
             days_layout.addWidget(c, i // 4, i % 4)
 
         root.addWidget(days_box)
+        self.days_box = days_box
 
         self.warn_box = QGroupBox("Avisos previos para horario programado")
         warn_layout = QHBoxLayout(self.warn_box)
@@ -657,10 +710,11 @@ class ScheduleEditor(QDialog):
         root.addWidget(self.warn_box)
 
         note = QLabel(
-            "Si desactivas «Usar hora programada», la acción podrá "
-            "ejecutarse a cualquier hora de los días seleccionados cuando "
-            "se alcance el tiempo de inactividad. En ese modo la inactividad "
-            "es obligatoria.\n\n"
+            "El modo Intervalo comienza al guardar y se ejecuta una sola vez. "
+            "Al completarse queda desactivado; editarlo o reactivarlo inicia "
+            "un intervalo nuevo. Los días no se aplican a Intervalo.\n\n"
+            "En Solo inactividad, la acción puede ejecutarse a cualquier hora "
+            "de los días seleccionados y la inactividad es obligatoria.\n\n"
             "El cierre seguro de aplicaciones se usa para Apagar y Reiniciar "
             "mediante la sesión de Plasma, evitando matar los programas a la fuerza."
         )
@@ -674,7 +728,7 @@ class ScheduleEditor(QDialog):
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
-        self.use_time.toggled.connect(self._refresh_mode_controls)
+        self.mode.currentIndexChanged.connect(self._refresh_mode_controls)
         self.require_idle.toggled.connect(self._refresh_mode_controls)
         self.action.currentIndexChanged.connect(self._refresh_action_controls)
 
@@ -682,18 +736,27 @@ class ScheduleEditor(QDialog):
         self._refresh_action_controls()
 
     def _refresh_mode_controls(self):
-        timed = self.use_time.isChecked()
+        mode = self.mode.currentData()
+        timed = mode == "time"
+        interval = mode == "interval"
 
         self.time.setEnabled(timed)
         self.warn_box.setEnabled(timed)
+        self.interval_hours.setEnabled(interval)
+        self.interval_minutes.setEnabled(interval)
+        self.days_box.setEnabled(not interval)
 
-        if not timed:
+        if mode == "idle":
             self.require_idle.setChecked(True)
             self.require_idle.setEnabled(False)
             self.idle_minutes.setEnabled(True)
         else:
             self.require_idle.setEnabled(True)
             self.idle_minutes.setEnabled(self.require_idle.isChecked())
+
+    def _ensure_interval_duration(self):
+        if self.interval_hours.value() == 0 and self.interval_minutes.value() == 0:
+            self.interval_minutes.setValue(1)
 
     def _refresh_action_controls(self):
         action = self.action.currentData()
@@ -716,7 +779,13 @@ class ScheduleEditor(QDialog):
             if c.isChecked()
         ]
 
-        use_time = self.use_time.isChecked()
+        mode = self.mode.currentData()
+        use_time = mode == "time"
+        interval_minutes = max(
+            1,
+            self.interval_hours.value() * 60
+            + self.interval_minutes.value(),
+        )
         action = self.action.currentData()
 
         return Schedule(
@@ -724,13 +793,15 @@ class ScheduleEditor(QDialog):
             name=self.name.text().strip() or "Programación",
             enabled=self.enabled.isChecked(),
             use_time=use_time,
+            trigger_mode=mode,
+            interval_minutes=interval_minutes,
             time=self.time.time().toString("HH:mm"),
             weekdays=weekdays,
             action=action,
             warning_minutes=sorted(warns, reverse=True),
             final_countdown_seconds=self.countdown.value(),
             require_idle=(
-                True if not use_time
+                True if mode == "idle"
                 else self.require_idle.isChecked()
             ),
             idle_minutes=self.idle_minutes.value(),
@@ -763,7 +834,10 @@ class MainWindow(QMainWindow):
         self.install_poll_timer.timeout.connect(self._poll_update_install)
 
         self.condition_engine = ConditionEngine()
-        self._prune_pending_occurrences()
+        self._reconcile_schedule_occurrences(
+            self.schedules(),
+            now=datetime.now(),
+        )
 
         self.last_activity_monotonic = time.monotonic()
         self.last_activity_device = "inicio de AMP AutoPower"
@@ -952,10 +1026,9 @@ class MainWindow(QMainWindow):
                 log(f"Programación inválida ignorada: {e}")
         return out
 
-    def set_schedules(self, schedules):
-        self.config["schedules"] = [asdict(s) for s in schedules]
-        save_json(CONFIG_FILE, self.config)
-
+    def set_schedules(self, schedules, restart_interval_ids=None, now=None):
+        previous_ids = {s.id for s in self.schedules()}
+        restart_ids = set(restart_interval_ids or ())
         schedules_by_id = {s.id: s for s in schedules}
         for dlg in list(self.active_dialogs.values()):
             dialog_schedule = getattr(dlg, "schedule", None)
@@ -964,40 +1037,154 @@ class MainWindow(QMainWindow):
             if schedule_id and (
                 updated is None
                 or not updated.enabled
-                or not updated.weekdays
-                or bool(updated.use_time) != bool(dialog_schedule.use_time)
+                or (
+                    schedule_trigger_mode(updated) != "interval"
+                    and not updated.weekdays
+                )
+                or schedule_trigger_mode(updated)
+                != schedule_trigger_mode(dialog_schedule)
+                or schedule_id in restart_ids
             ):
                 dlg.finish("cancel")
 
-        self._prune_pending_occurrences(schedules)
+        self.config["schedules"] = [schedule_to_dict(s) for s in schedules]
+        save_json(CONFIG_FILE, self.config)
+
+        removed_ids = previous_ids - set(schedules_by_id)
+        for schedule_id in removed_ids:
+            for state_key in (
+                "last_runs",
+                "snoozes",
+                "skipped_targets",
+                "pending_occurrences",
+                "completed_intervals",
+            ):
+                self.state.get(state_key, {}).pop(schedule_id, None)
+
+        self._reconcile_schedule_occurrences(
+            schedules,
+            restart_interval_ids=restart_interval_ids,
+            now=now,
+        )
+        if removed_ids:
+            save_json(STATE_FILE, self.state)
         self.refresh_list()
 
     def _prune_pending_occurrences(self, schedules=None):
         if schedules is None:
-            valid_ids = {
-                raw.get("id")
+            valid_modes = {
+                raw.get("id"): schedule_trigger_mode(raw)
                 for raw in self.config.get("schedules", [])
                 if (
                     isinstance(raw, dict)
                     and raw.get("enabled", True)
-                    and raw.get("use_time", True)
-                    and raw.get("weekdays", [])
+                    and (
+                        schedule_trigger_mode(raw) == "interval"
+                        or (
+                            schedule_trigger_mode(raw) == "time"
+                            and raw.get("weekdays", [])
+                        )
+                    )
                 )
             }
         else:
-            valid_ids = {
-                s.id
+            valid_modes = {
+                s.id: schedule_trigger_mode(s)
                 for s in schedules
-                if s.enabled and s.use_time and s.weekdays
+                if (
+                    s.enabled
+                    and (
+                        schedule_trigger_mode(s) == "interval"
+                        or (
+                            schedule_trigger_mode(s) == "time"
+                            and s.weekdays
+                        )
+                    )
+                )
             }
 
         pending = self.state.setdefault("pending_occurrences", {})
-        removed = [sid for sid in pending if sid not in valid_ids]
+        removed = [
+            sid
+            for sid, raw in pending.items()
+            if (
+                not isinstance(raw, dict)
+                or sid not in valid_modes
+                or str(raw.get("trigger_type", "time"))
+                != valid_modes[sid]
+            )
+        ]
         for sid in removed:
             pending.pop(sid, None)
             self.state.get("snoozes", {}).pop(sid, None)
         if removed:
             save_json(STATE_FILE, self.state)
+
+    def _reconcile_schedule_occurrences(
+        self,
+        schedules,
+        restart_interval_ids=None,
+        now=None,
+    ):
+        now = now or datetime.now()
+        restart_ids = set(restart_interval_ids or ())
+        self._prune_pending_occurrences(schedules)
+        changed = False
+
+        interval_ids = {
+            s.id
+            for s in schedules
+            if schedule_trigger_mode(s) == "interval"
+        }
+        completed_intervals = self.state.setdefault("completed_intervals", {})
+        for schedule_id in list(completed_intervals):
+            if schedule_id not in interval_ids:
+                completed_intervals.pop(schedule_id, None)
+                changed = True
+
+        for s in schedules:
+            if not s.enabled or schedule_trigger_mode(s) != "interval":
+                continue
+
+            occurrence = self.pending_occurrence(s)
+            completed = s.id in self.state.get("completed_intervals", {})
+            should_restart = s.id in restart_ids
+
+            if completed and not should_restart:
+                continue
+            if (
+                not should_restart
+                and occurrence is not None
+                and occurrence.trigger_type == "interval"
+            ):
+                continue
+
+            self._start_interval_occurrence(s, now, save=False)
+            changed = True
+
+        if changed:
+            save_json(STATE_FILE, self.state)
+
+    def _start_interval_occurrence(self, s, now, save=True):
+        occurrence = ScheduledOccurrence.create_interval(
+            s.id,
+            now,
+            int(s.interval_minutes),
+            int(s.final_countdown_seconds),
+        )
+        self.state.setdefault("pending_occurrences", {})[
+            s.id
+        ] = occurrence.to_state()
+        for state_key in (
+            "last_runs",
+            "snoozes",
+            "skipped_targets",
+            "completed_intervals",
+        ):
+            self.state.get(state_key, {}).pop(s.id, None)
+        if save:
+            save_json(STATE_FILE, self.state)
+        return occurrence
 
     def save_settings(self):
         self.config["start_minimized"] = self.start_min.isChecked()
@@ -1213,16 +1400,22 @@ class MainWindow(QMainWindow):
         self.list.clear()
 
         for s in self.schedules():
-            days = (
-                "Todos"
-                if len(s.weekdays) == 7
-                else ", ".join(WEEKDAYS[i] for i in s.weekdays)
-            )
+            mode = schedule_trigger_mode(s)
+            if mode == "interval":
+                days = "Una vez"
+            else:
+                days = (
+                    "Todos"
+                    if len(s.weekdays) == 7
+                    else ", ".join(WEEKDAYS[i] for i in s.weekdays)
+                )
 
             status = "✓" if s.enabled else "✗"
 
-            if getattr(s, "use_time", True):
+            if mode == "time":
                 trigger = s.time
+            elif mode == "interval":
+                trigger = f"Intervalo {format_interval(s.interval_minutes)}"
             else:
                 trigger = f"Inactividad {s.idle_minutes} min"
 
@@ -1245,8 +1438,14 @@ class MainWindow(QMainWindow):
         dlg = ScheduleEditor(self)
         if dlg.exec() == QDialog.Accepted:
             ss = self.schedules()
-            ss.append(dlg.get_schedule())
-            self.set_schedules(ss)
+            added = dlg.get_schedule()
+            ss.append(added)
+            restart_ids = (
+                {added.id}
+                if schedule_trigger_mode(added) == "interval"
+                else None
+            )
+            self.set_schedules(ss, restart_interval_ids=restart_ids)
 
     def edit_schedule(self):
         sid = self.get_selected_id()
@@ -1260,7 +1459,13 @@ class MainWindow(QMainWindow):
         if dlg.exec() == QDialog.Accepted:
             updated = dlg.get_schedule()
             ss = [updated if s.id == sid else s for s in ss]
-            self.set_schedules(ss)
+            restart_ids = (
+                {sid}
+                if updated.enabled
+                and schedule_trigger_mode(updated) == "interval"
+                else None
+            )
+            self.set_schedules(ss, restart_interval_ids=restart_ids)
 
     def delete_schedule(self):
         sid = self.get_selected_id()
@@ -1270,7 +1475,7 @@ class MainWindow(QMainWindow):
             self.set_schedules([s for s in self.schedules() if s.id != sid])
 
     def next_occurrence(self, s: Schedule, now=None):
-        if not getattr(s, "use_time", True):
+        if schedule_trigger_mode(s) != "time":
             return None
 
         now = now or datetime.now()
@@ -1309,7 +1514,8 @@ class MainWindow(QMainWindow):
             if not s.enabled:
                 continue
 
-            if not getattr(s, "use_time", True):
+            mode = schedule_trigger_mode(s)
+            if mode == "idle":
                 if now.weekday() in s.weekdays:
                     idle_modes.append(s)
                 continue
@@ -1333,7 +1539,7 @@ class MainWindow(QMainWindow):
             m, _ = divmod(rem, 60)
 
             parts.append(
-                f"Próxima acción con hora: "
+                f"Próxima acción: "
                 f"<b>{ACTIONS.get(s.action, s.action)}</b> — "
                 f"<b>{nxt.strftime('%a %d/%m %H:%M')}</b> — "
                 f"faltan {h} h {m} min"
@@ -1388,6 +1594,8 @@ class MainWindow(QMainWindow):
         if completed == occurrence.scheduled_target.isoformat():
             self.state.get("pending_occurrences", {}).pop(s.id, None)
             self.state.get("snoozes", {}).pop(s.id, None)
+            if schedule_trigger_mode(s) == "interval":
+                self._complete_interval_schedule(s, occurrence.scheduled_target)
             save_json(STATE_FILE, self.state)
             return
 
@@ -1568,11 +1776,26 @@ class MainWindow(QMainWindow):
         }
 
         for s in self.schedules():
-            if not s.enabled or not s.weekdays:
+            if not s.enabled:
                 continue
 
-            if not getattr(s, "use_time", True):
+            mode = schedule_trigger_mode(s)
+            if mode != "interval" and not s.weekdays:
+                continue
+            if mode == "idle":
                 self._idle_only_tick(s, now)
+                continue
+            if mode == "interval":
+                occurrence = self.pending_occurrence(s)
+                if occurrence is None:
+                    completed = s.id in self.state.get(
+                        "completed_intervals",
+                        {},
+                    )
+                    if not completed:
+                        occurrence = self._start_interval_occurrence(s, now)
+                if occurrence is not None:
+                    self._pending_occurrence_tick(s, occurrence, now)
                 continue
 
             self._timed_schedule_tick(s, now)
@@ -1609,7 +1832,39 @@ class MainWindow(QMainWindow):
         self.state.setdefault("skipped_targets", {})[s.id] = target.isoformat()
         self.state.get("snoozes", {}).pop(s.id, None)
         self.state.get("pending_occurrences", {}).pop(s.id, None)
+        self._complete_interval_schedule(s, target)
         save_json(STATE_FILE, self.state)
+
+    def _complete_interval_schedule(self, s, target):
+        if schedule_trigger_mode(s) != "interval":
+            return
+
+        matching = next(
+            (
+                raw
+                for raw in self.config.get("schedules", [])
+                if (
+                    isinstance(raw, dict)
+                    and raw.get("id") == s.id
+                    and schedule_trigger_mode(raw) == "interval"
+                )
+            ),
+            None,
+        )
+        if matching is None:
+            return
+
+        self.state.setdefault("completed_intervals", {})[
+            s.id
+        ] = target.isoformat()
+        changed = False
+        if matching.get("enabled", True):
+            matching["enabled"] = False
+            changed = True
+        if changed:
+            save_json(CONFIG_FILE, self.config)
+        if hasattr(self, "list"):
+            self.refresh_list()
 
     def snooze(self, s, minutes, target=None):
         now = datetime.now()
@@ -1617,15 +1872,26 @@ class MainWindow(QMainWindow):
 
         self.state.setdefault("snoozes", {})[s.id] = dt.isoformat()
 
-        if getattr(s, "use_time", True):
+        if schedule_trigger_mode(s) != "idle":
             occurrence = self.pending_occurrence(s)
             if occurrence is None and target is not None:
-                occurrence = ScheduledOccurrence.create(
-                    s.id,
-                    target,
-                    int(s.final_countdown_seconds),
-                    created_at=now,
-                )
+                if schedule_trigger_mode(s) == "interval":
+                    start_at = target - timedelta(
+                        minutes=max(1, int(s.interval_minutes))
+                    )
+                    occurrence = ScheduledOccurrence.create_interval(
+                        s.id,
+                        start_at,
+                        int(s.interval_minutes),
+                        int(s.final_countdown_seconds),
+                    )
+                else:
+                    occurrence = ScheduledOccurrence.create(
+                        s.id,
+                        target,
+                        int(s.final_countdown_seconds),
+                        created_at=now,
+                    )
                 if now >= target:
                     occurrence = occurrence.mark_armed()
             if occurrence is not None:
@@ -1823,13 +2089,48 @@ class MainWindow(QMainWindow):
 
         return True
 
-    def execute_action(self, s, target):
+    def _record_action_completion(self, s, target):
         self.state.setdefault("last_runs", {})[s.id] = target.isoformat()
         self.state.get("snoozes", {}).pop(s.id, None)
         self.state.get("pending_occurrences", {}).pop(s.id, None)
+        self._complete_interval_schedule(s, target)
         save_json(STATE_FILE, self.state)
 
+    def _guard_interval_execution(self, s, target):
+        if schedule_trigger_mode(s) != "interval":
+            return
+        self._complete_interval_schedule(s, target)
+        save_json(STATE_FILE, self.state)
+
+    def _restore_failed_interval_execution(self, s):
+        if schedule_trigger_mode(s) != "interval":
+            return
+        self.state.get("completed_intervals", {}).pop(s.id, None)
+        changed = False
+        for raw in self.config.get("schedules", []):
+            if (
+                isinstance(raw, dict)
+                and raw.get("id") == s.id
+                and schedule_trigger_mode(raw) == "interval"
+            ):
+                if not raw.get("enabled", True):
+                    raw["enabled"] = True
+                    changed = True
+                break
+        if changed:
+            save_json(CONFIG_FILE, self.config)
+        save_json(STATE_FILE, self.state)
+        if hasattr(self, "list"):
+            self.refresh_list()
+
+    def execute_action(self, s, target):
+        is_interval = schedule_trigger_mode(s) == "interval"
+        if not is_interval:
+            self._record_action_completion(s, target)
+
         if s.action == "test":
+            if is_interval:
+                self._record_action_completion(s, target)
             self.notify(
                 "Prueba completada",
                 "El aviso y la cuenta regresiva funcionan correctamente.",
@@ -1883,14 +2184,29 @@ class MainWindow(QMainWindow):
                 True,
             )
 
-            result = run_cmd([
-                qdbus,
-                "org.kde.Shutdown",
-                "/Shutdown",
-                method,
-            ])
+            if is_interval:
+                self._guard_interval_execution(s, target)
+            try:
+                result = run_cmd([
+                    qdbus,
+                    "org.kde.Shutdown",
+                    "/Shutdown",
+                    method,
+                ])
+            except Exception as e:
+                if not is_interval:
+                    raise
+                self._restore_failed_interval_execution(s)
+                self.notify(
+                    "No se pudo iniciar el cierre seguro",
+                    str(e),
+                    True,
+                )
+                return
 
             if result.returncode != 0:
+                if is_interval:
+                    self._restore_failed_interval_execution(s)
                 self.notify(
                     "No se pudo iniciar el cierre seguro",
                     result.stderr.strip()
@@ -1898,6 +2214,8 @@ class MainWindow(QMainWindow):
                     or "qdbus devolvió un error desconocido.",
                     True,
                 )
+            elif is_interval:
+                self._record_action_completion(s, target)
 
             # logoutAndShutdown/logoutAndReboot ya realizan la acción.
             return
@@ -1925,14 +2243,31 @@ class MainWindow(QMainWindow):
             True,
         )
 
-        result = run_cmd(cmd)
+        if is_interval:
+            self._guard_interval_execution(s, target)
+        try:
+            result = run_cmd(cmd)
+        except Exception as e:
+            if not is_interval:
+                raise
+            self._restore_failed_interval_execution(s)
+            self.notify(
+                "No se pudo ejecutar la acción",
+                str(e),
+                True,
+            )
+            return
 
         if result.returncode != 0:
+            if is_interval:
+                self._restore_failed_interval_execution(s)
             self.notify(
                 "No se pudo ejecutar la acción",
                 result.stderr.strip() or "Error desconocido",
                 True,
             )
+        elif is_interval:
+            self._record_action_completion(s, target)
 
     def cancel_next_run(self):
         active = [
