@@ -1,8 +1,9 @@
+import signal
 import unittest
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from amp_autopower import MainWindow, Schedule, schedule_to_dict
 from condition_engine import (
@@ -25,7 +26,18 @@ class SchedulerHarness:
     _record_action_completion = MainWindow._record_action_completion
     _guard_interval_execution = MainWindow._guard_interval_execution
     _restore_failed_interval_execution = MainWindow._restore_failed_interval_execution
+    _close_chrome_cleanly = MainWindow._close_chrome_cleanly
+    _handle_pre_action_failure = MainWindow._handle_pre_action_failure
+    _finish_pre_action = MainWindow._finish_pre_action
+    _cancel_pre_action = MainWindow._cancel_pre_action
+    _pre_action_timed_out = MainWindow._pre_action_timed_out
+    _kill_timed_out_pre_action = MainWindow._kill_timed_out_pre_action
+    _run_pre_action = MainWindow._run_pre_action
     execute_action = MainWindow.execute_action
+    _find_qdbus = MainWindow._find_qdbus
+    _session_action_command = MainWindow._session_action_command
+    _run_final_command = MainWindow._run_final_command
+    _execute_final_action = MainWindow._execute_final_action
     evaluate_conditions = MainWindow.evaluate_conditions
     defer_for_idle = MainWindow.defer_for_idle
     _defer_for_conditions = MainWindow._defer_for_conditions
@@ -34,6 +46,7 @@ class SchedulerHarness:
     _idle_only_tick = MainWindow._idle_only_tick
     _timed_schedule_tick = MainWindow._timed_schedule_tick
     next_occurrence = MainWindow.next_occurrence
+    cancel_next_run = MainWindow.cancel_next_run
     snooze = MainWindow.snooze
     set_schedules = MainWindow.set_schedules
     mark_skipped = MainWindow.mark_skipped
@@ -54,6 +67,7 @@ class SchedulerHarness:
             "schedules": [],
         }
         self.warned = set()
+        self._pre_action_processes = {}
         self._idle_seconds = idle_seconds
         self._reliable = reliable
         self._cpu_reading = cpu_reading or CPUReading(
@@ -79,6 +93,7 @@ class SchedulerHarness:
             ),
         )
         self.started = []
+        self.notifications = []
 
     def idle_seconds(self):
         return self._idle_seconds
@@ -86,8 +101,8 @@ class SchedulerHarness:
     def input_monitor_reliable(self):
         return self._reliable
 
-    def notify(self, *_args, **_kwargs):
-        pass
+    def notify(self, *args, **kwargs):
+        self.notifications.append((args, kwargs))
 
     def show_warning_banner(self, *_args, **_kwargs):
         pass
@@ -100,6 +115,7 @@ class SchedulerHarness:
         cpu_settings = self.config.get("cpu_settings", {})
         network_settings = self.config.get("network_settings", {})
         logic_settings = self.config.get("condition_logic_settings", {})
+        action_settings = self.config.get("action_settings", {})
         for raw in self.config.get("schedules", []):
             data = dict(raw)
             preset = cpu_settings.get(data.get("id"), {})
@@ -114,11 +130,102 @@ class SchedulerHarness:
                 "condition_logic",
                 logic_settings.get(data.get("id"), "AND"),
             )
+            action_preset = action_settings.get(data.get("id"), {})
+            if isinstance(action_preset, dict):
+                for key, value in action_preset.items():
+                    data.setdefault(key, value)
             out.append(Schedule(**data))
         return out
 
     def refresh_list(self):
         pass
+
+
+class FakeSignal:
+    def __init__(self):
+        self.callbacks = []
+
+    def connect(self, callback):
+        self.callbacks.append(callback)
+
+    def emit(self, *args):
+        for callback in list(self.callbacks):
+            callback(*args)
+
+
+class FakeTimer:
+    instances = []
+
+    def __init__(self, _parent=None):
+        self.timeout = FakeSignal()
+        self.interval = None
+        self.stopped = False
+        self.__class__.instances.append(self)
+
+    def setSingleShot(self, _single_shot):
+        pass
+
+    def start(self, interval):
+        self.interval = interval
+
+    def stop(self):
+        self.stopped = True
+
+
+class FakeProcess:
+    NotRunning = 0
+    Running = 1
+    instances = []
+
+    def __init__(self, _parent=None):
+        self.finished = FakeSignal()
+        self.errorOccurred = FakeSignal()
+        self.program = None
+        self.arguments = None
+        self.started = False
+        self.terminated = False
+        self.killed = False
+        self.deleted = False
+        self.process_state = self.NotRunning
+        self.exit_code = 0
+        self.stderr = b""
+        self.stdout = b""
+        self.error_text = ""
+        self.__class__.instances.append(self)
+
+    def setProgram(self, program):
+        self.program = program
+
+    def setArguments(self, arguments):
+        self.arguments = arguments
+
+    def start(self):
+        self.started = True
+        self.process_state = self.Running
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+
+    def state(self):
+        return self.process_state
+
+    def exitCode(self):
+        return self.exit_code
+
+    def readAllStandardError(self):
+        return self.stderr
+
+    def readAllStandardOutput(self):
+        return self.stdout
+
+    def errorString(self):
+        return self.error_text
+
+    def deleteLater(self):
+        self.deleted = True
 
 
 class SchedulerCompatibilityTests(unittest.TestCase):
@@ -160,6 +267,8 @@ class SchedulerCompatibilityTests(unittest.TestCase):
             self.assertNotIn("require_network", serialized)
             self.assertNotIn("network_threshold", serialized)
             self.assertNotIn("condition_logic", serialized)
+            self.assertNotIn("pre_action_enabled", serialized)
+            self.assertNotIn("pre_action_command", serialized)
 
         serialized_or = schedule_to_dict(Schedule(id="or", condition_logic="OR"))
         self.assertNotIn("condition_logic", serialized_or)
@@ -540,6 +649,10 @@ class SchedulerCompatibilityTests(unittest.TestCase):
         harness.config["network_settings"] = {
             item.id: {"network_interface": "enp1s0"}
         }
+        harness.config["condition_logic_settings"] = {item.id: "OR"}
+        harness.config["action_settings"] = {
+            item.id: {"pre_action_enabled": True}
+        }
 
         with patch("amp_autopower.save_json"):
             harness.set_schedules([], now=target)
@@ -554,6 +667,8 @@ class SchedulerCompatibilityTests(unittest.TestCase):
             self.assertNotIn(item.id, state[state_key])
         self.assertNotIn(item.id, harness.config["cpu_settings"])
         self.assertNotIn(item.id, harness.config["network_settings"])
+        self.assertNotIn(item.id, harness.config["condition_logic_settings"])
+        self.assertNotIn(item.id, harness.config["action_settings"])
 
     def test_completed_interval_is_disabled_and_not_restarted(self):
         item = Schedule(
@@ -1591,6 +1706,710 @@ class SchedulerCompatibilityTests(unittest.TestCase):
             item.id,
             harness.config["condition_logic_settings"],
         )
+
+    def test_pre_action_round_trip_uses_compatibility_map(self):
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        item = Schedule(
+            id="pre-action",
+            pre_action_enabled=True,
+            pre_action_command="/usr/bin/example --save",
+            pre_action_wait=False,
+            pre_action_timeout_seconds=90,
+            pre_action_failure_policy="continue",
+        )
+
+        with patch("amp_autopower.save_json"):
+            harness.set_schedules(
+                [item],
+                now=datetime(2026, 8, 31, 12, 0),
+            )
+
+        serialized = harness.config["schedules"][0]
+        for field in (
+            "pre_action_enabled",
+            "pre_action_command",
+            "pre_action_wait",
+            "pre_action_timeout_seconds",
+            "pre_action_failure_policy",
+        ):
+            self.assertNotIn(field, serialized)
+        self.assertEqual(
+            harness.config["action_settings"][item.id],
+            {
+                "pre_action_enabled": True,
+                "pre_action_command": "/usr/bin/example --save",
+                "pre_action_wait": False,
+                "pre_action_timeout_seconds": 90,
+                "pre_action_failure_policy": "continue",
+            },
+        )
+        restored = harness.schedules()[0]
+        self.assertTrue(restored.pre_action_enabled)
+        self.assertEqual(restored.pre_action_command, item.pre_action_command)
+        self.assertFalse(restored.pre_action_wait)
+        self.assertEqual(restored.pre_action_timeout_seconds, 90)
+        self.assertEqual(restored.pre_action_failure_policy, "continue")
+
+        with patch("amp_autopower.save_json"):
+            harness.set_schedules(
+                [Schedule(id=item.id)],
+                now=datetime(2026, 8, 31, 12, 1),
+            )
+
+        self.assertNotIn(item.id, harness.config["action_settings"])
+
+    def test_disabled_pre_action_runs_final_action_directly(self):
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        harness._run_pre_action = MagicMock()
+        target = datetime(2026, 8, 31, 12, 0)
+        item = Schedule(
+            id="disabled-pre-action",
+            action="test",
+            pre_action_enabled=False,
+            pre_action_command="/does/not/exist",
+        )
+
+        with patch("amp_autopower.save_json"):
+            harness.execute_action(item, target)
+
+        harness._run_pre_action.assert_not_called()
+        self.assertEqual(state["last_runs"][item.id], target.isoformat())
+
+    def test_waited_pre_action_parses_arguments_and_runs_final_action(self):
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        target = datetime(2026, 8, 31, 12, 0)
+        item = Schedule(
+            id="pre-action",
+            action="test",
+            pre_action_enabled=True,
+            pre_action_command='"/tmp/My Tool" --flag "two words"',
+            pre_action_timeout_seconds=17,
+        )
+        FakeProcess.instances = []
+        FakeTimer.instances = []
+
+        with (
+            patch("amp_autopower.QProcess", FakeProcess),
+            patch("amp_autopower.QTimer", FakeTimer),
+            patch("amp_autopower.save_json"),
+        ):
+            harness.execute_action(item, target)
+            process = FakeProcess.instances[0]
+            self.assertEqual(process.program, "/tmp/My Tool")
+            self.assertEqual(process.arguments, ["--flag", "two words"])
+            self.assertTrue(process.started)
+            self.assertEqual(FakeTimer.instances[0].interval, 17000)
+            self.assertNotIn(item.id, state["last_runs"])
+
+            process.process_state = FakeProcess.NotRunning
+            process.finished.emit(0, None)
+
+        self.assertEqual(state["last_runs"][item.id], target.isoformat())
+        self.assertTrue(process.deleted)
+        self.assertEqual(harness._pre_action_processes, {})
+
+    def test_running_pre_action_blocks_duplicate_countdown(self):
+        target = datetime(2026, 8, 31, 12, 0)
+        occurrence = ScheduledOccurrence.create_interval(
+            "interval",
+            target - timedelta(minutes=30),
+            30,
+            60,
+        )
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {
+                "interval": occurrence.to_state(),
+            },
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        item = Schedule(
+            id="interval",
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=30,
+            weekdays=[],
+            action="test",
+            pre_action_enabled=True,
+            pre_action_command="/usr/bin/example",
+        )
+        harness.config["schedules"] = [schedule_to_dict(item)]
+        FakeProcess.instances = []
+        FakeTimer.instances = []
+
+        with (
+            patch("amp_autopower.QProcess", FakeProcess),
+            patch("amp_autopower.QTimer", FakeTimer),
+            patch("amp_autopower.save_json"),
+        ):
+            harness.execute_action(item, target)
+            self.assertTrue(harness._has_active_dialog_for_schedule(item.id))
+            harness._pending_occurrence_tick(item, occurrence, target)
+            self.assertEqual(harness.started, [])
+
+            process = FakeProcess.instances[0]
+            process.process_state = FakeProcess.NotRunning
+            process.finished.emit(0, None)
+
+        self.assertIn(item.id, state["completed_intervals"])
+
+    def test_nonzero_pre_action_applies_cancel_or_continue_policy(self):
+        target = datetime(2026, 8, 31, 12, 0)
+
+        for policy in ("cancel", "continue"):
+            with self.subTest(policy=policy):
+                state = {
+                    "last_runs": {},
+                    "snoozes": {},
+                    "skipped_targets": {},
+                    "pending_occurrences": {},
+                    "completed_intervals": {},
+                }
+                harness = SchedulerHarness(state)
+                item = Schedule(
+                    id=policy,
+                    action="test",
+                    pre_action_enabled=True,
+                    pre_action_command="/usr/bin/example",
+                    pre_action_failure_policy=policy,
+                )
+                FakeProcess.instances = []
+                FakeTimer.instances = []
+
+                with (
+                    patch("amp_autopower.QProcess", FakeProcess),
+                    patch("amp_autopower.QTimer", FakeTimer),
+                    patch("amp_autopower.save_json"),
+                ):
+                    harness.execute_action(item, target)
+                    process = FakeProcess.instances[0]
+                    process.stderr = b"simulated command failure"
+                    process.process_state = FakeProcess.NotRunning
+                    process.finished.emit(7, None)
+
+                expected = target.isoformat()
+                if policy == "cancel":
+                    expected += ":skipped"
+                self.assertEqual(state["last_runs"][item.id], expected)
+                self.assertTrue(
+                    any(
+                        "simulated command failure" in args[1]
+                        for args, _kwargs in harness.notifications
+                    )
+                )
+
+    def test_missing_pre_action_program_is_reported_and_cancelled(self):
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        target = datetime(2026, 8, 31, 12, 0)
+        item = Schedule(
+            id="missing",
+            action="test",
+            pre_action_enabled=True,
+            pre_action_command="/does/not/exist",
+        )
+        FakeProcess.instances = []
+        FakeTimer.instances = []
+
+        with (
+            patch("amp_autopower.QProcess", FakeProcess),
+            patch("amp_autopower.QTimer", FakeTimer),
+            patch("amp_autopower.save_json"),
+        ):
+            harness.execute_action(item, target)
+            process = FakeProcess.instances[0]
+            process.error_text = "No such file or directory"
+            process.process_state = FakeProcess.NotRunning
+            process.errorOccurred.emit("FailedToStart")
+
+        self.assertEqual(
+            state["last_runs"][item.id],
+            target.isoformat() + ":skipped",
+        )
+        self.assertIn("No such file", harness.notifications[-1][0][1])
+
+    def test_editing_schedule_cancels_stale_running_pre_action(self):
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        target = datetime(2026, 8, 31, 12, 0)
+        item = Schedule(
+            id="edited",
+            name="Original",
+            action="test",
+            pre_action_enabled=True,
+            pre_action_command="/usr/bin/example",
+        )
+        updated = Schedule(
+            id=item.id,
+            name="Updated",
+            action="test",
+            pre_action_enabled=True,
+            pre_action_command="/usr/bin/example",
+        )
+        FakeProcess.instances = []
+        FakeTimer.instances = []
+
+        with (
+            patch("amp_autopower.QProcess", FakeProcess),
+            patch("amp_autopower.QTimer", FakeTimer),
+            patch("amp_autopower.save_json"),
+        ):
+            harness.set_schedules([item], now=target)
+            harness.execute_action(item, target)
+            process = FakeProcess.instances[0]
+
+            harness.set_schedules([updated], now=target)
+            self.assertTrue(process.terminated)
+            process.process_state = FakeProcess.NotRunning
+            process.finished.emit(0, None)
+
+        self.assertNotIn(item.id, state["last_runs"])
+        self.assertEqual(harness._pre_action_processes, {})
+
+    def test_cancel_next_run_stops_running_pre_action(self):
+        target = datetime(2026, 8, 31, 12, 0)
+        occurrence = ScheduledOccurrence.create_interval(
+            "interval",
+            target - timedelta(minutes=30),
+            30,
+            60,
+        )
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {
+                "interval": occurrence.to_state(),
+            },
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        item = Schedule(
+            id="interval",
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=30,
+            weekdays=[],
+            action="test",
+            pre_action_enabled=True,
+            pre_action_command="/usr/bin/example",
+        )
+        harness.config["schedules"] = [schedule_to_dict(item)]
+        FakeProcess.instances = []
+        FakeTimer.instances = []
+
+        with (
+            patch("amp_autopower.QProcess", FakeProcess),
+            patch("amp_autopower.QTimer", FakeTimer),
+            patch("amp_autopower.save_json"),
+        ):
+            harness.execute_action(item, target)
+            process = FakeProcess.instances[0]
+            harness.cancel_next_run()
+            self.assertTrue(process.terminated)
+            self.assertEqual(
+                state["last_runs"][item.id],
+                target.isoformat() + ":skipped",
+            )
+
+            process.process_state = FakeProcess.NotRunning
+            process.finished.emit(0, None)
+
+        self.assertEqual(
+            state["last_runs"][item.id],
+            target.isoformat() + ":skipped",
+        )
+        self.assertEqual(harness._pre_action_processes, {})
+
+    def test_failed_pre_action_does_not_consume_interval(self):
+        target = datetime(2026, 8, 31, 12, 0)
+        occurrence = ScheduledOccurrence.create_interval(
+            "interval",
+            target - timedelta(minutes=30),
+            30,
+            60,
+        )
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {
+                "interval": occurrence.to_state(),
+            },
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        item = Schedule(
+            id="interval",
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=30,
+            weekdays=[],
+            action="test",
+            pre_action_enabled=True,
+            pre_action_command='"unterminated',
+        )
+        harness.config["schedules"] = [schedule_to_dict(item)]
+
+        with patch("amp_autopower.save_json"):
+            harness.execute_action(item, target)
+
+        self.assertTrue(harness.schedules()[0].enabled)
+        self.assertNotIn(item.id, state["last_runs"])
+        self.assertNotIn(item.id, state["completed_intervals"])
+        self.assertIn(item.id, state["pending_occurrences"])
+        self.assertIn("comando no es válido", harness.notifications[-1][0][1])
+
+    def test_pre_action_timeout_cancels_without_consuming_interval(self):
+        target = datetime(2026, 8, 31, 12, 0)
+        occurrence = ScheduledOccurrence.create_interval(
+            "interval",
+            target - timedelta(minutes=30),
+            30,
+            60,
+        )
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {
+                "interval": occurrence.to_state(),
+            },
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        item = Schedule(
+            id="interval",
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=30,
+            weekdays=[],
+            action="test",
+            pre_action_enabled=True,
+            pre_action_command="/usr/bin/example",
+            pre_action_timeout_seconds=3,
+        )
+        harness.config["schedules"] = [schedule_to_dict(item)]
+        FakeProcess.instances = []
+        FakeTimer.instances = []
+
+        with (
+            patch("amp_autopower.QProcess", FakeProcess),
+            patch("amp_autopower.QTimer", FakeTimer),
+            patch("amp_autopower.save_json"),
+        ):
+            harness.execute_action(item, target)
+            process = FakeProcess.instances[0]
+            FakeTimer.instances[0].timeout.emit()
+            self.assertTrue(process.terminated)
+            self.assertEqual(FakeTimer.instances[1].interval, 2000)
+            FakeTimer.instances[1].timeout.emit()
+            self.assertTrue(process.killed)
+            process.process_state = FakeProcess.NotRunning
+            process.finished.emit(-15, None)
+
+        self.assertTrue(harness.schedules()[0].enabled)
+        self.assertNotIn(item.id, state["completed_intervals"])
+        self.assertIn(item.id, state["pending_occurrences"])
+        self.assertIn("timeout de 3 segundos", harness.notifications[-1][0][1])
+
+    def test_pre_action_timeout_can_continue_to_final_action(self):
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        target = datetime(2026, 8, 31, 12, 0)
+        item = Schedule(
+            id="timeout-continue",
+            action="test",
+            pre_action_enabled=True,
+            pre_action_command="/usr/bin/example",
+            pre_action_timeout_seconds=2,
+            pre_action_failure_policy="continue",
+        )
+        FakeProcess.instances = []
+        FakeTimer.instances = []
+
+        with (
+            patch("amp_autopower.QProcess", FakeProcess),
+            patch("amp_autopower.QTimer", FakeTimer),
+            patch("amp_autopower.save_json"),
+        ):
+            harness.execute_action(item, target)
+            process = FakeProcess.instances[0]
+            FakeTimer.instances[0].timeout.emit()
+            process.process_state = FakeProcess.NotRunning
+            process.finished.emit(-15, None)
+
+        self.assertEqual(state["last_runs"][item.id], target.isoformat())
+        self.assertTrue(
+            any(
+                "timeout de 2 segundos" in args[1]
+                for args, _kwargs in harness.notifications
+            )
+        )
+
+    def test_pre_action_failure_can_continue_to_final_action(self):
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        target = datetime(2026, 8, 31, 12, 0)
+        item = Schedule(
+            id="continue",
+            action="test",
+            pre_action_enabled=True,
+            pre_action_command="",
+            pre_action_failure_policy="continue",
+        )
+
+        with patch("amp_autopower.save_json"):
+            harness.execute_action(item, target)
+
+        self.assertEqual(state["last_runs"][item.id], target.isoformat())
+        self.assertEqual(harness.notifications[-1][0][0], "Prueba completada")
+
+    def test_detached_pre_action_exception_cancels_final_action(self):
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        target = datetime(2026, 8, 31, 12, 0)
+        item = Schedule(
+            id="detached-error",
+            action="test",
+            pre_action_enabled=True,
+            pre_action_command="/usr/bin/example",
+            pre_action_wait=False,
+        )
+
+        with (
+            patch(
+                "amp_autopower.QProcess.startDetached",
+                side_effect=OSError("simulated start failure"),
+            ),
+            patch("amp_autopower.save_json"),
+        ):
+            harness.execute_action(item, target)
+
+        self.assertEqual(
+            state["last_runs"][item.id],
+            target.isoformat() + ":skipped",
+        )
+        self.assertEqual(state["skipped_targets"][item.id], target.isoformat())
+        self.assertIn("simulated start failure", harness.notifications[-1][0][1])
+
+    def test_session_action_falls_back_to_gdbus_then_loginctl(self):
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        harness._find_qdbus = lambda: None
+
+        with patch(
+            "amp_autopower.shutil.which",
+            side_effect=lambda name: (
+                "/usr/bin/gdbus" if name == "gdbus" else None
+            ),
+        ):
+            logout = harness._session_action_command("logout")
+        self.assertEqual(logout[0:3], ["/usr/bin/gdbus", "call", "--session"])
+        self.assertEqual(logout[-1], "org.kde.Shutdown.logout")
+
+        with patch(
+            "amp_autopower.shutil.which",
+            side_effect=lambda name: (
+                "/usr/bin/loginctl" if name == "loginctl" else None
+            ),
+        ):
+            lock = harness._session_action_command("lock")
+        self.assertEqual(lock, ["/usr/bin/loginctl", "lock-session"])
+
+    def test_detached_pre_action_uses_argument_vector(self):
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        target = datetime(2026, 8, 31, 12, 0)
+        item = Schedule(
+            id="detached",
+            action="test",
+            pre_action_enabled=True,
+            pre_action_command="/usr/bin/example --save now",
+            pre_action_wait=False,
+        )
+
+        with (
+            patch(
+                "amp_autopower.QProcess.startDetached",
+                return_value=(True, 1234),
+            ) as start_detached,
+            patch("amp_autopower.save_json"),
+        ):
+            harness.execute_action(item, target)
+
+        start_detached.assert_called_once_with(
+            "/usr/bin/example",
+            ["--save", "now"],
+        )
+        self.assertEqual(state["last_runs"][item.id], target.isoformat())
+
+    def test_logout_and_lock_use_session_dbus_without_closing_chrome(self):
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        success = SimpleNamespace(returncode=0, stderr="", stdout="")
+
+        for action, method in (
+            ("logout", "org.kde.Shutdown.logout"),
+            ("lock", "org.freedesktop.ScreenSaver.Lock"),
+        ):
+            with self.subTest(action=action):
+                harness = SchedulerHarness(state)
+                harness._close_chrome_cleanly = MagicMock(return_value=True)
+                item = Schedule(
+                    id=action,
+                    action=action,
+                    close_apps_first=True,
+                )
+                with (
+                    patch(
+                        "amp_autopower.shutil.which",
+                        side_effect=lambda name: (
+                            "/usr/bin/qdbus6" if name == "qdbus6" else None
+                        ),
+                    ),
+                    patch(
+                        "amp_autopower.run_cmd",
+                        return_value=success,
+                    ) as command,
+                    patch("amp_autopower.save_json"),
+                ):
+                    harness.execute_action(item, datetime(2026, 8, 31, 12, 0))
+
+                self.assertEqual(command.call_args.args[0][-1], method)
+                harness._close_chrome_cleanly.assert_not_called()
+
+    def test_safe_power_actions_keep_chrome_then_plasma_shutdown(self):
+        success = SimpleNamespace(returncode=0, stderr="", stdout="")
+
+        for action, method in (
+            ("poweroff", "org.kde.Shutdown.logoutAndShutdown"),
+            ("reboot", "org.kde.Shutdown.logoutAndReboot"),
+        ):
+            with self.subTest(action=action):
+                state = {
+                    "last_runs": {},
+                    "snoozes": {},
+                    "skipped_targets": {},
+                    "pending_occurrences": {},
+                    "completed_intervals": {},
+                }
+                harness = SchedulerHarness(state)
+                harness._close_chrome_cleanly = MagicMock(return_value=True)
+                item = Schedule(
+                    id=action,
+                    action=action,
+                    close_apps_first=True,
+                )
+
+                with (
+                    patch(
+                        "amp_autopower.shutil.which",
+                        side_effect=lambda name: (
+                            "/usr/bin/qdbus6" if name == "qdbus6" else None
+                        ),
+                    ),
+                    patch(
+                        "amp_autopower.run_cmd",
+                        return_value=success,
+                    ) as command,
+                    patch("amp_autopower.save_json"),
+                ):
+                    harness.execute_action(item, datetime(2026, 8, 31, 12, 0))
+
+                harness._close_chrome_cleanly.assert_called_once_with()
+                self.assertEqual(command.call_args.args[0][-1], method)
+
+    def test_chrome_clean_close_sends_sighup_to_main_process(self):
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        harness._chrome_main_processes = lambda: [(1234, ["chrome"])]
+
+        with (
+            patch("amp_autopower.os.kill") as kill,
+            patch("amp_autopower.Path.exists", return_value=False),
+            patch("amp_autopower.time.sleep"),
+        ):
+            self.assertTrue(harness._close_chrome_cleanly())
+
+        kill.assert_called_once_with(1234, signal.SIGHUP)
 
     def test_timed_or_cpu_starts_countdown_before_time_window(self):
         now = datetime(2026, 8, 31, 23, 20)

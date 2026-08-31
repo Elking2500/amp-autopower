@@ -2,6 +2,7 @@ import os
 import unittest
 from dataclasses import asdict
 from types import SimpleNamespace
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -204,6 +205,51 @@ class ScheduleEditorTabsTests(unittest.TestCase):
         self.assertEqual(saved.time, legacy.time)
         self.assertEqual(saved.weekdays, legacy.weekdays)
         self.assertEqual(saved.trigger_mode, "time")
+        self.assertFalse(saved.pre_action_enabled)
+        self.assertEqual(saved.pre_action_command, "")
+        self.assertTrue(saved.pre_action_wait)
+        self.assertEqual(saved.pre_action_timeout_seconds, 60)
+        self.assertEqual(saved.pre_action_failure_policy, "cancel")
+
+    def test_pre_action_controls_and_full_round_trip(self):
+        source = Schedule(
+            id="pre-action",
+            trigger_mode="time",
+            action="logout",
+            close_apps_first=False,
+            network_interface="enp1s0",
+            pre_action_enabled=True,
+            pre_action_command='"/tmp/My Tool" --save',
+            pre_action_wait=True,
+            pre_action_timeout_seconds=125,
+            pre_action_failure_policy="continue",
+        )
+        editor = self.editor(source)
+
+        self.assertTrue(editor.pre_action_command.isEnabled())
+        self.assertTrue(editor.pre_action_wait.isEnabled())
+        self.assertTrue(editor.pre_action_timeout.isEnabled())
+        self.assertTrue(editor.pre_action_failure_policy.isEnabled())
+        self.assertFalse(editor.close_apps.isEnabled())
+        self.assertEqual(asdict(editor.get_schedule()), asdict(source))
+
+        editor.pre_action_wait.setChecked(False)
+        self.assertFalse(editor.pre_action_timeout.isEnabled())
+        editor.pre_action_enabled.setChecked(False)
+        self.assertFalse(editor.pre_action_command.isEnabled())
+        self.assertFalse(editor.pre_action_wait.isEnabled())
+        self.assertFalse(editor.pre_action_failure_policy.isEnabled())
+
+    def test_pre_action_browse_quotes_paths_with_spaces(self):
+        editor = self.editor(Schedule(pre_action_enabled=True))
+
+        with patch(
+            "amp_autopower.QFileDialog.getOpenFileName",
+            return_value=("/tmp/My Tool", ""),
+        ):
+            editor.pre_action_browse.click()
+
+        self.assertEqual(editor.pre_action_command.text(), "'/tmp/My Tool'")
 
     def test_tabs_follow_application_palette(self):
         original = self.app.palette()

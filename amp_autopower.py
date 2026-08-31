@@ -6,6 +6,7 @@ import os
 import signal
 import re
 import select
+import shlex
 import socket
 import threading
 import time
@@ -42,7 +43,10 @@ from compact_display import (
     restore_display_position,
     store_display_options,
 )
-from PySide6.QtCore import QLocale, Qt, QTimer, QLockFile, QStandardPaths, QThread, Signal
+from PySide6.QtCore import (
+    QLocale, QObject, QProcess, Qt, QTimer, QLockFile, QStandardPaths,
+    QThread, Signal,
+)
 from PySide6.QtGui import QAction, QColor, QCloseEvent, QIcon, QPalette
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
@@ -80,6 +84,8 @@ ACTIONS = {
     "reboot": "Reiniciar",
     "suspend": "Suspender",
     "hibernate": "Hibernar",
+    "logout": "Cerrar sesión",
+    "lock": "Bloquear sesión",
     "test": "Solo aviso (prueba)",
 }
 
@@ -425,11 +431,24 @@ class Schedule:
     network_use_average: bool = False
     network_average_seconds: int = 60
     close_apps_first: bool = True
+    pre_action_enabled: bool = False
+    pre_action_command: str = ""
+    pre_action_wait: bool = True
+    pre_action_timeout_seconds: int = 60
+    pre_action_failure_policy: str = "cancel"
 
 
 def schedule_to_dict(schedule):
     data = asdict(schedule)
     data.pop("condition_logic", None)
+    for key in (
+        "pre_action_enabled",
+        "pre_action_command",
+        "pre_action_wait",
+        "pre_action_timeout_seconds",
+        "pre_action_failure_policy",
+    ):
+        data.pop(key, None)
     if schedule_trigger_mode(schedule) != "interval":
         data.pop("trigger_mode", None)
         data.pop("interval_minutes", None)
@@ -475,6 +494,7 @@ DEFAULT_CONFIG = {
     "cpu_settings": {},
     "network_settings": {},
     "condition_logic_settings": {},
+    "action_settings": {},
     "display_enabled": False,
     "display_always_on_top": True,
     "display_show_title": True,
@@ -1059,6 +1079,50 @@ class ScheduleEditor(QDialog):
             getattr(s, "close_apps_first", True)
         )
 
+        self.pre_action_enabled = QCheckBox(
+            "Ejecutar programa/comando antes de la acción"
+        )
+        self.pre_action_enabled.setChecked(
+            getattr(s, "pre_action_enabled", False)
+        )
+        self.pre_action_command = QLineEdit(
+            getattr(s, "pre_action_command", "")
+        )
+        self.pre_action_browse = QPushButton("Examinar...")
+        pre_action_command_row = QHBoxLayout()
+        pre_action_command_row.addWidget(self.pre_action_command, 1)
+        pre_action_command_row.addWidget(self.pre_action_browse)
+
+        self.pre_action_wait = QCheckBox("Esperar a que termine")
+        self.pre_action_wait.setChecked(
+            getattr(s, "pre_action_wait", True)
+        )
+        self.pre_action_timeout = QSpinBox()
+        self.pre_action_timeout.setRange(1, 3600)
+        self.pre_action_timeout.setSuffix(" s")
+        self.pre_action_timeout.setValue(
+            max(
+                1,
+                min(
+                    3600,
+                    int(getattr(s, "pre_action_timeout_seconds", 60)),
+                ),
+            )
+        )
+        self.pre_action_failure_policy = QComboBox()
+        self.pre_action_failure_policy.addItem(
+            "Cancelar acción",
+            "cancel",
+        )
+        self.pre_action_failure_policy.addItem(
+            "Continuar de todos modos",
+            "continue",
+        )
+        policy_index = self.pre_action_failure_policy.findData(
+            getattr(s, "pre_action_failure_policy", "cancel")
+        )
+        self.pre_action_failure_policy.setCurrentIndex(max(0, policy_index))
+
         days_box = QGroupBox("Días de la semana")
         days_layout = QGridLayout(days_box)
 
@@ -1100,8 +1164,8 @@ class ScheduleEditor(QDialog):
         action_note = QLabel(
             "El cierre seguro de aplicaciones se usa para Apagar y Reiniciar "
             "mediante la sesión de Plasma, evitando matar los programas a la "
-            "fuerza. Las opciones avanzadas previas a la acción se añadirán "
-            "en esta pestaña en una fase futura."
+            "fuerza. Cerrar sesión usa el cierre normal de Plasma. Bloquear "
+            "no cierra Chrome ni otras aplicaciones."
         )
         action_note.setWordWrap(True)
 
@@ -1167,9 +1231,25 @@ class ScheduleEditor(QDialog):
 
         action_tab = QWidget()
         action_layout = QVBoxLayout(action_tab)
-        action_form = QFormLayout()
-        action_form.addRow("Cierre seguro:", self.close_apps)
-        action_layout.addLayout(action_form)
+        safe_close_box = QGroupBox("Cierre seguro")
+        safe_close_layout = QVBoxLayout(safe_close_box)
+        safe_close_layout.addWidget(self.close_apps)
+        action_layout.addWidget(safe_close_box)
+
+        pre_action_box = QGroupBox("Programa previo")
+        pre_action_form = QFormLayout(pre_action_box)
+        pre_action_form.addRow(self.pre_action_enabled)
+        pre_action_form.addRow("Comando/programa:", pre_action_command_row)
+        pre_action_form.addRow(self.pre_action_wait)
+        pre_action_form.addRow("Timeout:", self.pre_action_timeout)
+        pre_action_form.addRow(
+            "Si falla:",
+            self.pre_action_failure_policy,
+        )
+        pre_action_form.setFieldGrowthPolicy(
+            QFormLayout.AllNonFixedFieldsGrow
+        )
+        action_layout.addWidget(pre_action_box)
         action_layout.addWidget(action_note)
         action_layout.addStretch()
         self.tabs.addTab(action_tab, "Acción")
@@ -1190,12 +1270,20 @@ class ScheduleEditor(QDialog):
             self._refresh_network_controls
         )
         self.action.currentIndexChanged.connect(self._refresh_action_controls)
+        self.pre_action_enabled.toggled.connect(
+            self._refresh_pre_action_controls
+        )
+        self.pre_action_wait.toggled.connect(
+            self._refresh_pre_action_controls
+        )
+        self.pre_action_browse.clicked.connect(self._browse_pre_action)
 
         self._refresh_mode_controls()
         self._refresh_cpu_controls()
         self._refresh_network_controls()
         self._refresh_logic_controls()
         self._refresh_action_controls()
+        self._refresh_pre_action_controls()
 
     def _refresh_mode_controls(self):
         mode = self.mode.currentData()
@@ -1265,6 +1353,24 @@ class ScheduleEditor(QDialog):
         action = self.action.currentData()
         self.close_apps.setEnabled(action in ("poweroff", "reboot"))
 
+    def _refresh_pre_action_controls(self):
+        enabled = self.pre_action_enabled.isChecked()
+        self.pre_action_command.setEnabled(enabled)
+        self.pre_action_browse.setEnabled(enabled)
+        self.pre_action_wait.setEnabled(enabled)
+        self.pre_action_timeout.setEnabled(
+            enabled and self.pre_action_wait.isChecked()
+        )
+        self.pre_action_failure_policy.setEnabled(enabled)
+
+    def _browse_pre_action(self):
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Seleccionar programa o comando",
+        )
+        if path:
+            self.pre_action_command.setText(shlex.quote(path))
+
     def get_schedule(self):
         warns = []
 
@@ -1329,6 +1435,13 @@ class ScheduleEditor(QDialog):
                 if action in ("poweroff", "reboot")
                 else False
             ),
+            pre_action_enabled=self.pre_action_enabled.isChecked(),
+            pre_action_command=self.pre_action_command.text().strip(),
+            pre_action_wait=self.pre_action_wait.isChecked(),
+            pre_action_timeout_seconds=self.pre_action_timeout.value(),
+            pre_action_failure_policy=(
+                self.pre_action_failure_policy.currentData()
+            ),
         )
 
 
@@ -1343,6 +1456,7 @@ class MainWindow(QMainWindow):
         self.update_thread = None
         self.download_thread = None
         self.download_dialog = None
+        self._pre_action_processes = {}
         self.available_update = self.state.get("available_update")
 
         # Control del instalador que espera al OK antes de reiniciar.
@@ -1608,6 +1722,7 @@ class MainWindow(QMainWindow):
         cpu_settings = self.config.get("cpu_settings", {})
         network_settings = self.config.get("network_settings", {})
         logic_settings = self.config.get("condition_logic_settings", {})
+        action_settings = self.config.get("action_settings", {})
         for raw in self.config.get("schedules", []):
             try:
                 data = dict(raw)
@@ -1623,6 +1738,10 @@ class MainWindow(QMainWindow):
                     "condition_logic",
                     logic_settings.get(data.get("id"), "AND"),
                 )
+                action_preset = action_settings.get(data.get("id"), {})
+                if isinstance(action_preset, dict):
+                    for key, value in action_preset.items():
+                        data.setdefault(key, value)
                 out.append(Schedule(**data))
             except Exception as e:
                 log(f"Programación inválida ignorada: {e}")
@@ -1701,6 +1820,13 @@ class MainWindow(QMainWindow):
                 or schedule_id in restart_ids
             ):
                 dlg.finish("cancel")
+        for context in list(
+            getattr(self, "_pre_action_processes", {}).values()
+        ):
+            process = context["process"]
+            updated = schedules_by_id.get(context["schedule"].id)
+            if updated is None or updated != context["schedule"]:
+                self._cancel_pre_action(process)
 
         cpu_settings = self.config.setdefault("cpu_settings", {})
         cpu_defaults = {
@@ -1749,11 +1875,29 @@ class MainWindow(QMainWindow):
                 logic_settings[schedule.id] = "OR"
             else:
                 logic_settings.pop(schedule.id, None)
+        action_settings = self.config.setdefault("action_settings", {})
+        action_defaults = {
+            "pre_action_enabled": False,
+            "pre_action_command": "",
+            "pre_action_wait": True,
+            "pre_action_timeout_seconds": 60,
+            "pre_action_failure_policy": "cancel",
+        }
+        for schedule in schedules:
+            configured = {
+                key: getattr(schedule, key)
+                for key in action_defaults
+            }
+            if configured != action_defaults:
+                action_settings[schedule.id] = configured
+            else:
+                action_settings.pop(schedule.id, None)
         removed_ids = previous_ids - set(schedules_by_id)
         for schedule_id in removed_ids:
             cpu_settings.pop(schedule_id, None)
             network_settings.pop(schedule_id, None)
             logic_settings.pop(schedule_id, None)
+            action_settings.pop(schedule_id, None)
         self.config["schedules"] = [schedule_to_dict(s) for s in schedules]
         save_json(CONFIG_FILE, self.config)
 
@@ -2282,6 +2426,13 @@ class MainWindow(QMainWindow):
     def _has_active_dialog_for_schedule(self, schedule_id):
         for dlg in self.active_dialogs.values():
             if getattr(getattr(dlg, "schedule", None), "id", None) == schedule_id:
+                return True
+        for context in getattr(
+            self,
+            "_pre_action_processes",
+            {},
+        ).values():
+            if context["schedule"].id == schedule_id:
                 return True
         return False
 
@@ -3289,7 +3440,285 @@ class MainWindow(QMainWindow):
         if hasattr(self, "list"):
             self.refresh_list()
 
+    def _handle_pre_action_failure(self, s, target, reason):
+        log(f"Falló el programa previo de «{s.name}»: {reason}")
+        if getattr(s, "pre_action_failure_policy", "cancel") == "continue":
+            self.notify(
+                "Falló el programa previo",
+                f"{reason}\n\nLa acción programada continuará.",
+                True,
+            )
+            self._execute_final_action(s, target)
+            return
+
+        if schedule_trigger_mode(s) != "interval":
+            self.mark_skipped(s, target)
+        self.notify(
+            "Acción cancelada",
+            f"El programa previo falló y la acción no se ejecutará.\n\n{reason}",
+            True,
+        )
+
+    def _finish_pre_action(self, process, exit_code=None, error=None):
+        contexts = getattr(self, "_pre_action_processes", {})
+        context = contexts.pop(id(process), None)
+        if context is None:
+            return
+
+        context["timer"].stop()
+        if context.get("kill_timer") is not None:
+            context["kill_timer"].stop()
+
+        s = context["schedule"]
+        target = context["target"]
+        timed_out = context.get("timed_out", False)
+        cancelled = context.get("cancelled", False)
+        stderr = bytes(process.readAllStandardError()).decode(
+            "utf-8",
+            "replace",
+        ).strip()
+        stdout = bytes(process.readAllStandardOutput()).decode(
+            "utf-8",
+            "replace",
+        ).strip()
+        error_text = process.errorString() if error is not None else ""
+        process.deleteLater()
+
+        if cancelled:
+            return
+        if timed_out:
+            reason = (
+                "El programa previo superó el timeout de "
+                f"{context['timeout_seconds']} segundos."
+            )
+        elif error is not None:
+            reason = error_text or str(error)
+        elif exit_code != 0:
+            reason = stderr or stdout or f"Terminó con código {exit_code}."
+        else:
+            self._execute_final_action(s, target)
+            return
+
+        self._handle_pre_action_failure(s, target, reason)
+
+    def _cancel_pre_action(self, process):
+        context = getattr(self, "_pre_action_processes", {}).get(id(process))
+        if context is None:
+            return
+        context["cancelled"] = True
+        context["timer"].stop()
+        if process.state() == QProcess.NotRunning:
+            self._finish_pre_action(process, exit_code=process.exitCode())
+            return
+        process.terminate()
+
+        kill_timer = QTimer(process)
+        kill_timer.setSingleShot(True)
+        kill_timer.timeout.connect(
+            lambda p=process: self._kill_timed_out_pre_action(p)
+        )
+        context["kill_timer"] = kill_timer
+        kill_timer.start(2000)
+
+    def _pre_action_timed_out(self, process):
+        context = getattr(self, "_pre_action_processes", {}).get(id(process))
+        if context is None:
+            return
+        context["timed_out"] = True
+        process.terminate()
+
+        kill_timer = QTimer(process)
+        kill_timer.setSingleShot(True)
+        kill_timer.timeout.connect(
+            lambda p=process: self._kill_timed_out_pre_action(p)
+        )
+        context["kill_timer"] = kill_timer
+        kill_timer.start(2000)
+
+    def _kill_timed_out_pre_action(self, process):
+        context = getattr(self, "_pre_action_processes", {}).get(id(process))
+        if context is None:
+            return
+        if process.state() != QProcess.NotRunning:
+            process.kill()
+        else:
+            self._finish_pre_action(process, exit_code=process.exitCode())
+
+    def _run_pre_action(self, s, target):
+        command = getattr(s, "pre_action_command", "").strip()
+        try:
+            args = shlex.split(command)
+        except ValueError as exc:
+            self._handle_pre_action_failure(
+                s,
+                target,
+                f"El comando no es válido: {exc}",
+            )
+            return
+
+        if not args:
+            self._handle_pre_action_failure(
+                s,
+                target,
+                "No se configuró ningún comando.",
+            )
+            return
+
+        program, program_args = args[0], args[1:]
+        log("Ejecutando programa previo: " + " ".join(args))
+        if not getattr(s, "pre_action_wait", True):
+            try:
+                started = QProcess.startDetached(program, program_args)
+                if isinstance(started, tuple):
+                    started = started[0]
+            except Exception as exc:
+                self._handle_pre_action_failure(s, target, str(exc))
+                return
+            if not started:
+                self._handle_pre_action_failure(
+                    s,
+                    target,
+                    f"No se pudo iniciar «{program}».",
+                )
+                return
+            self._execute_final_action(s, target)
+            return
+
+        parent = self if isinstance(self, QObject) else None
+        process = QProcess(parent)
+        process.setProgram(program)
+        process.setArguments(program_args)
+        timeout_seconds = max(
+            1,
+            min(
+                3600,
+                int(getattr(s, "pre_action_timeout_seconds", 60)),
+            ),
+        )
+        timer = QTimer(process)
+        timer.setSingleShot(True)
+        contexts = getattr(self, "_pre_action_processes", None)
+        if contexts is None:
+            contexts = {}
+            self._pre_action_processes = contexts
+        contexts[id(process)] = {
+            "process": process,
+            "schedule": s,
+            "target": target,
+            "timer": timer,
+            "kill_timer": None,
+            "timed_out": False,
+            "cancelled": False,
+            "timeout_seconds": timeout_seconds,
+        }
+        process.finished.connect(
+            lambda exit_code, _status, p=process: self._finish_pre_action(
+                p,
+                exit_code=exit_code,
+            )
+        )
+        process.errorOccurred.connect(
+            lambda error, p=process: self._finish_pre_action(p, error=error)
+        )
+        timer.timeout.connect(
+            lambda p=process: self._pre_action_timed_out(p)
+        )
+        timer.start(timeout_seconds * 1000)
+        process.start()
+
     def execute_action(self, s, target):
+        if getattr(s, "pre_action_enabled", False):
+            self._run_pre_action(s, target)
+            return
+        self._execute_final_action(s, target)
+
+    def _find_qdbus(self):
+        for candidate in (
+            "qdbus6",
+            "qdbus",
+            "qdbus-qt6",
+            "qdbus-qt5",
+        ):
+            path = shutil.which(candidate)
+            if path:
+                return path
+        return None
+
+    def _session_action_command(self, action):
+        methods = {
+            "poweroff": (
+                "org.kde.Shutdown",
+                "/Shutdown",
+                "org.kde.Shutdown.logoutAndShutdown",
+            ),
+            "reboot": (
+                "org.kde.Shutdown",
+                "/Shutdown",
+                "org.kde.Shutdown.logoutAndReboot",
+            ),
+            "logout": (
+                "org.kde.Shutdown",
+                "/Shutdown",
+                "org.kde.Shutdown.logout",
+            ),
+            "lock": (
+                "org.freedesktop.ScreenSaver",
+                "/ScreenSaver",
+                "org.freedesktop.ScreenSaver.Lock",
+            ),
+        }
+        service, object_path, method = methods[action]
+        qdbus = self._find_qdbus()
+        if qdbus:
+            return [qdbus, service, object_path, method]
+
+        gdbus = shutil.which("gdbus")
+        if gdbus:
+            return [
+                gdbus,
+                "call",
+                "--session",
+                "--dest",
+                service,
+                "--object-path",
+                object_path,
+                "--method",
+                method,
+            ]
+        if action == "lock":
+            loginctl = shutil.which("loginctl")
+            if loginctl:
+                return [loginctl, "lock-session"]
+        return None
+
+    def _run_final_command(self, s, target, cmd, error_title):
+        is_interval = schedule_trigger_mode(s) == "interval"
+        if is_interval:
+            self._guard_interval_execution(s, target)
+        try:
+            result = run_cmd(cmd)
+        except Exception as exc:
+            if is_interval:
+                self._restore_failed_interval_execution(s)
+            self.notify(error_title, str(exc), True)
+            return False
+
+        if result.returncode != 0:
+            if is_interval:
+                self._restore_failed_interval_execution(s)
+            self.notify(
+                error_title,
+                result.stderr.strip()
+                or result.stdout.strip()
+                or "El comando devolvió un error desconocido.",
+                True,
+            )
+            return False
+        if is_interval:
+            self._record_action_completion(s, target)
+        return True
+
+    def _execute_final_action(self, s, target):
         is_interval = schedule_trigger_mode(s) == "interval"
         if not is_interval:
             self._record_action_completion(s, target)
@@ -3307,40 +3736,21 @@ class MainWindow(QMainWindow):
             getattr(s, "close_apps_first", True)
             and s.action in ("poweroff", "reboot")
         ):
+            cmd = self._session_action_command(s.action)
+            if not cmd:
+                self.notify(
+                    "No se ejecutó la acción",
+                    "La programación pidió cerrar las aplicaciones "
+                    "correctamente, pero no se encontró qdbus ni gdbus. "
+                    "Por seguridad no se forzó la acción.",
+                    True,
+                )
+                return
             # Chrome necesita una petición de salida propia antes del
             # cierre global de Plasma. SIGHUP fue probado manualmente
             # y conserva correctamente todas sus ventanas/pestañas.
             if not self._close_chrome_cleanly():
                 return
-
-            qdbus = None
-
-            for candidate in (
-                "qdbus6",
-                "qdbus",
-                "qdbus-qt6",
-                "qdbus-qt5",
-            ):
-                path = shutil.which(candidate)
-                if path:
-                    qdbus = path
-                    break
-
-            if not qdbus:
-                self.notify(
-                    "No se ejecutó la acción",
-                    "La programación pidió cerrar las aplicaciones "
-                    "correctamente, pero no se encontró qdbus6/qdbus. "
-                    "Por seguridad no se forzó el apagado.",
-                    True,
-                )
-                return
-
-            method = (
-                "org.kde.Shutdown.logoutAndShutdown"
-                if s.action == "poweroff"
-                else "org.kde.Shutdown.logoutAndReboot"
-            )
 
             self.notify(
                 "Cerrando aplicaciones",
@@ -3350,40 +3760,31 @@ class MainWindow(QMainWindow):
                 True,
             )
 
-            if is_interval:
-                self._guard_interval_execution(s, target)
-            try:
-                result = run_cmd([
-                    qdbus,
-                    "org.kde.Shutdown",
-                    "/Shutdown",
-                    method,
-                ])
-            except Exception as e:
-                if not is_interval:
-                    raise
-                self._restore_failed_interval_execution(s)
+            self._run_final_command(
+                s,
+                target,
+                cmd,
+                "No se pudo iniciar el cierre seguro",
+            )
+            return
+
+        if s.action in ("logout", "lock"):
+            cmd = self._session_action_command(s.action)
+            if not cmd:
                 self.notify(
-                    "No se pudo iniciar el cierre seguro",
-                    str(e),
+                    "No se ejecutó la acción",
+                    "No se encontró qdbus ni gdbus para controlar la "
+                    "sesión de Plasma.",
                     True,
                 )
                 return
-
-            if result.returncode != 0:
-                if is_interval:
-                    self._restore_failed_interval_execution(s)
-                self.notify(
-                    "No se pudo iniciar el cierre seguro",
-                    result.stderr.strip()
-                    or result.stdout.strip()
-                    or "qdbus devolvió un error desconocido.",
-                    True,
-                )
-            elif is_interval:
-                self._record_action_completion(s, target)
-
-            # logoutAndShutdown/logoutAndReboot ya realizan la acción.
+            self.notify("Ejecutando", ACTIONS[s.action], True)
+            self._run_final_command(
+                s,
+                target,
+                cmd,
+                f"No se pudo {ACTIONS[s.action].lower()}",
+            )
             return
 
         command_map = {
@@ -3409,31 +3810,12 @@ class MainWindow(QMainWindow):
             True,
         )
 
-        if is_interval:
-            self._guard_interval_execution(s, target)
-        try:
-            result = run_cmd(cmd)
-        except Exception as e:
-            if not is_interval:
-                raise
-            self._restore_failed_interval_execution(s)
-            self.notify(
-                "No se pudo ejecutar la acción",
-                str(e),
-                True,
-            )
-            return
-
-        if result.returncode != 0:
-            if is_interval:
-                self._restore_failed_interval_execution(s)
-            self.notify(
-                "No se pudo ejecutar la acción",
-                result.stderr.strip() or "Error desconocido",
-                True,
-            )
-        elif is_interval:
-            self._record_action_completion(s, target)
+        self._run_final_command(
+            s,
+            target,
+            cmd,
+            "No se pudo ejecutar la acción",
+        )
 
     def cancel_next_run(self):
         active = [
@@ -3443,6 +3825,22 @@ class MainWindow(QMainWindow):
         ]
         if active:
             min(active, key=lambda dlg: dlg.remaining).finish("cancel")
+            return
+
+        pre_actions = list(
+            getattr(self, "_pre_action_processes", {}).values()
+        )
+        if pre_actions:
+            context = min(pre_actions, key=lambda item: item["target"])
+            s = context["schedule"]
+            target = context["target"]
+            self._cancel_pre_action(context["process"])
+            self.mark_skipped(s, target)
+            self.notify(
+                "Acción cancelada",
+                f"«{s.name}» fue cancelada mientras se ejecutaba el "
+                "programa previo.",
+            )
             return
 
         now = datetime.now()

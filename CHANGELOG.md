@@ -5,6 +5,7 @@
 - Soporte en desarrollo para condiciones de actividad de red.
 - Soporte en desarrollo para combinar condiciones mediante AND/OR.
 - Display compacto configurable con estado de programaciones y condiciones.
+- Nuevas acciones para cerrar o bloquear la sesión y programas previos configurables antes de cualquier acción.
 
 ## 1.4.0-dev (en desarrollo)
 
