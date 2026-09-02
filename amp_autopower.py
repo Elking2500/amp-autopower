@@ -44,19 +44,32 @@ from compact_display import (
     store_display_options,
 )
 from PySide6.QtCore import (
-    QLocale, QObject, QProcess, Qt, QTimer, QLockFile, QStandardPaths,
-    QThread, Signal,
+    Q_ARG, Q_RETURN_ARG, QLocale, QMetaObject, QObject, QProcess, Qt,
+    QTimer, QLockFile, QStandardPaths, QThread, Signal,
 )
-from PySide6.QtGui import QAction, QColor, QCloseEvent, QIcon, QPalette
+from PySide6.QtGui import (
+    QAction, QColor, QCloseEvent, QIcon, QKeySequence, QPalette,
+)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
-    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QPushButton, QProgressDialog, QSpinBox, QSystemTrayIcon, QTabWidget,
-    QTimeEdit, QVBoxLayout, QWidget,
+    QKeySequenceEdit, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
+    QMessageBox, QPushButton, QProgressDialog, QSpinBox, QSystemTrayIcon,
+    QTabWidget, QTimeEdit, QVBoxLayout, QWidget,
 )
 from PySide6.QtCore import QTime
+
+try:
+    from PySide6.QtDBus import (
+        QDBusConnection, QDBusInterface, QDBusMessage,
+        QDBusServiceWatcher,
+    )
+except ImportError:
+    QDBusConnection = None
+    QDBusInterface = None
+    QDBusMessage = None
+    QDBusServiceWatcher = None
 
 try:
     import evdev
@@ -436,6 +449,8 @@ class Schedule:
     pre_action_wait: bool = True
     pre_action_timeout_seconds: int = 60
     pre_action_failure_policy: str = "cancel"
+    cancel_action_behavior: str = "none"
+    cancel_action_command: str = ""
 
 
 def schedule_to_dict(schedule):
@@ -447,6 +462,8 @@ def schedule_to_dict(schedule):
         "pre_action_wait",
         "pre_action_timeout_seconds",
         "pre_action_failure_policy",
+        "cancel_action_behavior",
+        "cancel_action_command",
     ):
         data.pop(key, None)
     if schedule_trigger_mode(schedule) != "interval":
@@ -481,6 +498,8 @@ def schedule_to_dict(schedule):
 DEFAULT_CONFIG = {
     "start_minimized": True,
     "close_to_tray": True,
+    "tray_visible": True,
+    "global_hotkey": "",
     "notifications": True,
     "sound": True,
     "input_monitor_enabled": True,
@@ -539,6 +558,183 @@ def save_json(path: Path, data):
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
+
+
+class GlobalShortcutManager(QObject):
+    activated = Signal()
+    status_changed = Signal(bool, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.last_error = ""
+        self._registered = False
+        self._root = None
+        self._component = None
+        self._shortcut_text = ""
+        self._action_id = [
+            APP_ID,
+            "show-hide-window",
+            APP_NAME,
+            "Mostrar/ocultar ventana principal",
+        ]
+        self._service_watcher = None
+        if QDBusServiceWatcher is not None:
+            watch_mode = (
+                QDBusServiceWatcher.WatchForRegistration
+                | QDBusServiceWatcher.WatchForUnregistration
+            )
+            self._service_watcher = QDBusServiceWatcher(
+                "org.kde.kglobalaccel",
+                QDBusConnection.sessionBus(),
+                watch_mode,
+                self,
+            )
+            self._service_watcher.serviceRegistered.connect(
+                self._on_service_registered
+            )
+            self._service_watcher.serviceUnregistered.connect(
+                self._on_service_unregistered
+            )
+
+    @property
+    def is_registered(self):
+        return self._registered
+
+    def _message_error(self, reply):
+        if reply.type() == QDBusMessage.ErrorMessage:
+            return reply.errorMessage() or "Error DBus desconocido."
+        return ""
+
+    def set_shortcut(self, shortcut_text):
+        self._deactivate()
+        self.last_error = ""
+        shortcut_text = str(shortcut_text or "").strip()
+        self._shortcut_text = shortcut_text
+        if not shortcut_text:
+            self.status_changed.emit(False, "")
+            return True
+        if QDBusInterface is None:
+            return self._fail("QtDBus no está disponible.")
+
+        sequence = QKeySequence.fromString(
+            shortcut_text,
+            QKeySequence.PortableText,
+        )
+        if sequence.isEmpty() or sequence.count() != 1:
+            return self._fail("El atajo global no es válido.")
+
+        try:
+            bus = QDBusConnection.sessionBus()
+            root = QDBusInterface(
+                "org.kde.kglobalaccel",
+                "/kglobalaccel",
+                "org.kde.KGlobalAccel",
+                bus,
+            )
+            if not root.isValid():
+                return self._fail(
+                    "El servicio de atajos globales de KDE no está disponible."
+                )
+
+            reply = root.call("doRegister", self._action_id)
+            error = self._message_error(reply)
+            if error:
+                return self._fail(error)
+            self._root = root
+            self._registered = True
+
+            key = sequence[0].toCombined()
+            assigned = QMetaObject.invokeMethod(
+                root,
+                "setShortcut",
+                Qt.DirectConnection,
+                Q_RETURN_ARG("QList<int>"),
+                Q_ARG("QStringList", self._action_id),
+                Q_ARG("QList<int>", [key]),
+                Q_ARG("uint", 6),
+            )
+            if not assigned:
+                return self._fail(
+                    "El atajo está ocupado o KDE rechazó su registro."
+                )
+
+            reply = root.call("getComponent", APP_ID)
+            error = self._message_error(reply)
+            if error or not reply.arguments():
+                return self._fail(
+                    error or "KDE no devolvió el componente."
+                )
+            component_path = reply.arguments()[0]
+            if hasattr(component_path, "path"):
+                component_path = component_path.path()
+            component = QDBusInterface(
+                "org.kde.kglobalaccel",
+                str(component_path),
+                "org.kde.kglobalaccel.Component",
+                bus,
+            )
+            if not component.isValid():
+                return self._fail(
+                    "No se pudo escuchar el atajo registrado."
+                )
+            component.globalShortcutPressed.connect(self._on_pressed)
+            self._component = component
+            self.status_changed.emit(True, "")
+            return True
+        except Exception as exc:
+            return self._fail(str(exc))
+
+    def disable(self):
+        self._shortcut_text = ""
+        self._deactivate()
+        self.status_changed.emit(False, "")
+
+    def _deactivate(self):
+        if self._registered and self._root is not None:
+            try:
+                self._root.call("setInactive", self._action_id)
+            except Exception:
+                pass
+        if self._component is not None:
+            self._component.deleteLater()
+        self._component = None
+        self._root = None
+        self._registered = False
+
+    def _fail(self, error):
+        self.last_error = error
+        self._deactivate()
+        self.status_changed.emit(False, error)
+        return False
+
+    def _on_service_unregistered(self, _service):
+        if not self._shortcut_text:
+            return
+        self._registered = False
+        self._root = None
+        if self._component is not None:
+            self._component.deleteLater()
+            self._component = None
+        self.status_changed.emit(
+            False,
+            "El servicio de atajos de KDE se reinició.",
+        )
+
+    def _on_service_registered(self, _service):
+        if self._shortcut_text:
+            shortcut = self._shortcut_text
+            QTimer.singleShot(
+                500,
+                lambda: self._retry_shortcut(shortcut),
+            )
+
+    def _retry_shortcut(self, shortcut):
+        if self._shortcut_text == shortcut:
+            self.set_shortcut(shortcut)
+
+    def _on_pressed(self, component, action, _timestamp):
+        if component == APP_ID and action == self._action_id[1]:
+            self.activated.emit()
 
 
 class UpdateCheckThread(QThread):
@@ -836,6 +1032,9 @@ class CountdownDialog(QDialog):
     def __init__(self, parent, schedule: Schedule, seconds: int):
         super().__init__(parent)
         self.schedule = schedule; self.remaining = seconds; self.result_action = "execute"; self.pages = []
+        self.cancelled_by_user = False
+        self.cancel_command_executed = False
+        self._finished = False
         self.setWindowTitle(f"{APP_NAME} — acción inminente"); self.setAttribute(Qt.WA_DontShowOnScreen, True)
         self.timer = QTimer(self); self.timer.timeout.connect(self.tick); self.timer.start(1000)
         self.keep_above = QTimer(self); self.keep_above.timeout.connect(self._raise_pages); self.keep_above.start(250)
@@ -846,7 +1045,7 @@ class CountdownDialog(QDialog):
         screens = QApplication.screens() if all_screens else [QApplication.primaryScreen()]
         for screen in screens:
             if screen is None: continue
-            page = OverlayPage(screen,self.schedule,self.remaining,use_24_hour); page.action_requested.connect(self.finish); page.setGeometry(screen.geometry()); self.pages.append(page)
+            page = OverlayPage(screen,self.schedule,self.remaining,use_24_hour); page.action_requested.connect(self._handle_user_action); page.setGeometry(screen.geometry()); self.pages.append(page)
     def show(self):
         self._make_pages()
         for page in self.pages:
@@ -861,7 +1060,15 @@ class CountdownDialog(QDialog):
         if self.remaining <= 0:
             self.timer.stop(); self.finish("execute"); return
         for page in self.pages: page.update_remaining(self.remaining)
-    def finish(self, action):
+    def _handle_user_action(self, action):
+        self.finish(action, user_requested=True)
+    def finish(self, action, user_requested=False):
+        if self._finished:
+            return
+        self._finished = True
+        self.cancelled_by_user = bool(
+            user_requested and action == "cancel"
+        )
         self.result_action = action; self.timer.stop(); self.keep_above.stop()
         for page in self.pages: page.hide(); page.close()
         self.pages.clear(); self.done(QDialog.Accepted)
@@ -1123,6 +1330,23 @@ class ScheduleEditor(QDialog):
         )
         self.pre_action_failure_policy.setCurrentIndex(max(0, policy_index))
 
+        self.cancel_action_behavior = QComboBox()
+        self.cancel_action_behavior.addItem("No hacer nada", "none")
+        self.cancel_action_behavior.addItem("Ejecutar comando", "command")
+        cancel_behavior_index = self.cancel_action_behavior.findData(
+            getattr(s, "cancel_action_behavior", "none")
+        )
+        self.cancel_action_behavior.setCurrentIndex(
+            max(0, cancel_behavior_index)
+        )
+        self.cancel_action_command = QLineEdit(
+            getattr(s, "cancel_action_command", "")
+        )
+        self.cancel_action_browse = QPushButton("Examinar...")
+        cancel_action_command_row = QHBoxLayout()
+        cancel_action_command_row.addWidget(self.cancel_action_command, 1)
+        cancel_action_command_row.addWidget(self.cancel_action_browse)
+
         days_box = QGroupBox("Días de la semana")
         days_layout = QGridLayout(days_box)
 
@@ -1250,6 +1474,21 @@ class ScheduleEditor(QDialog):
             QFormLayout.AllNonFixedFieldsGrow
         )
         action_layout.addWidget(pre_action_box)
+
+        cancel_action_box = QGroupBox("Al cancelar explícitamente")
+        cancel_action_form = QFormLayout(cancel_action_box)
+        cancel_action_form.addRow(
+            "Comportamiento:",
+            self.cancel_action_behavior,
+        )
+        cancel_action_form.addRow(
+            "Comando:",
+            cancel_action_command_row,
+        )
+        cancel_action_form.setFieldGrowthPolicy(
+            QFormLayout.AllNonFixedFieldsGrow
+        )
+        action_layout.addWidget(cancel_action_box)
         action_layout.addWidget(action_note)
         action_layout.addStretch()
         self.tabs.addTab(action_tab, "Acción")
@@ -1277,6 +1516,12 @@ class ScheduleEditor(QDialog):
             self._refresh_pre_action_controls
         )
         self.pre_action_browse.clicked.connect(self._browse_pre_action)
+        self.cancel_action_behavior.currentIndexChanged.connect(
+            self._refresh_cancel_action_controls
+        )
+        self.cancel_action_browse.clicked.connect(
+            self._browse_cancel_action
+        )
 
         self._refresh_mode_controls()
         self._refresh_cpu_controls()
@@ -1284,6 +1529,7 @@ class ScheduleEditor(QDialog):
         self._refresh_logic_controls()
         self._refresh_action_controls()
         self._refresh_pre_action_controls()
+        self._refresh_cancel_action_controls()
 
     def _refresh_mode_controls(self):
         mode = self.mode.currentData()
@@ -1371,6 +1617,19 @@ class ScheduleEditor(QDialog):
         if path:
             self.pre_action_command.setText(shlex.quote(path))
 
+    def _refresh_cancel_action_controls(self):
+        enabled = self.cancel_action_behavior.currentData() == "command"
+        self.cancel_action_command.setEnabled(enabled)
+        self.cancel_action_browse.setEnabled(enabled)
+
+    def _browse_cancel_action(self):
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Seleccionar comando al cancelar",
+        )
+        if path:
+            self.cancel_action_command.setText(shlex.quote(path))
+
     def get_schedule(self):
         warns = []
 
@@ -1442,6 +1701,8 @@ class ScheduleEditor(QDialog):
             pre_action_failure_policy=(
                 self.pre_action_failure_policy.currentData()
             ),
+            cancel_action_behavior=self.cancel_action_behavior.currentData(),
+            cancel_action_command=self.cancel_action_command.text().strip(),
         )
 
 
@@ -1517,10 +1778,10 @@ class MainWindow(QMainWindow):
         menu.addAction(update_action)
         menu.addSeparator()
         menu.addAction(quit_action)
-        self.tray.show()
+        self.tray.setVisible(self.config.get("tray_visible", True))
 
-        tabs = QTabWidget()
-        self.setCentralWidget(tabs)
+        self.main_tabs = QTabWidget()
+        self.setCentralWidget(self.main_tabs)
 
         sched_tab = QWidget()
         sched_lay = QVBoxLayout(sched_tab)
@@ -1546,21 +1807,43 @@ class MainWindow(QMainWindow):
         for b in (add_btn, edit_btn, del_btn, test_btn, cancel_btn):
             row.addWidget(b)
         sched_lay.addLayout(row)
-        tabs.addTab(sched_tab, "Programaciones")
+        self.main_tabs.addTab(sched_tab, "Programaciones")
 
         settings_tab = QWidget()
         settings_layout = QVBoxLayout(settings_tab)
-        self.start_min = QCheckBox("Iniciar minimizada en la bandeja")
-        self.close_tray = QCheckBox("Cerrar la ventana = minimizar a bandeja")
+        self.preferences_tabs = QTabWidget()
+        settings_layout.addWidget(self.preferences_tabs)
+
+        general_tab = QWidget()
+        general_layout = QVBoxLayout(general_tab)
+        self.start_min = QCheckBox("Iniciar con la ventana oculta")
+        self.tray_visible = QCheckBox("Mostrar icono en la bandeja del sistema")
+        self.close_tray = QCheckBox(
+            "Cerrar la ventana = ocultarla sin detener el scheduler"
+        )
         self.notifications = QCheckBox("Mostrar notificaciones previas")
         self.sound = QCheckBox("Reproducir sonido de aviso cuando sea posible")
         self.start_min.setChecked(self.config.get("start_minimized", True))
+        self.tray_visible.setChecked(self.config.get("tray_visible", True))
         self.close_tray.setChecked(self.config.get("close_to_tray", True))
         self.notifications.setChecked(self.config.get("notifications", True))
         self.sound.setChecked(self.config.get("sound", True))
         for w in (self.start_min, self.close_tray, self.notifications, self.sound):
-            settings_layout.addWidget(w)
+            general_layout.addWidget(w)
             w.toggled.connect(self.save_settings)
+        general_layout.insertWidget(1, self.tray_visible)
+        self.tray_visible.toggled.connect(self.set_tray_visible)
+        recovery_note = QLabel(
+            "Si ocultas la bandeja puedes recuperar la ventana con el "
+            "atajo global o ejecutando amp-autopower --show."
+        )
+        recovery_note.setWordWrap(True)
+        general_layout.addWidget(recovery_note)
+        general_layout.addStretch()
+        self.preferences_tabs.addTab(general_tab, "General")
+
+        behavior_tab = QWidget()
+        behavior_layout = QVBoxLayout(behavior_tab)
 
         overlay_box = QGroupBox("Avisos sobre juegos y pantalla completa")
         overlay_lay = QVBoxLayout(overlay_box)
@@ -1572,7 +1855,7 @@ class MainWindow(QMainWindow):
         self.overlay_all_schedule_warnings.setChecked(self.config.get("overlay_all_schedule_warnings", True))
         for w in (self.fullscreen_overlay, self.overlay_all_screens, self.overlay_all_schedule_warnings):
             overlay_lay.addWidget(w); w.toggled.connect(self.save_settings)
-        settings_layout.addWidget(overlay_box)
+        behavior_layout.addWidget(overlay_box)
 
         display_box = QGroupBox("Display compacto")
         display_lay = QFormLayout(display_box)
@@ -1603,7 +1886,11 @@ class MainWindow(QMainWindow):
         display_lay.addRow(self.display_show_action)
         display_lay.addRow("Transparencia:", self.display_transparency)
         display_lay.addRow(self.display_use_24_hour)
-        settings_layout.addWidget(display_box)
+        display_tab = QWidget()
+        display_tab_layout = QVBoxLayout(display_tab)
+        display_tab_layout.addWidget(display_box)
+        display_tab_layout.addStretch()
+        self.preferences_tabs.addTab(display_tab, "Display")
         self.display_enabled.toggled.connect(self.set_display_enabled)
         for widget in (
             self.display_always_on_top,
@@ -1616,6 +1903,42 @@ class MainWindow(QMainWindow):
             self.save_display_settings
         )
 
+        shortcuts_tab = QWidget()
+        shortcuts_layout = QVBoxLayout(shortcuts_tab)
+        shortcuts_form = QFormLayout()
+        self.global_hotkey_edit = QKeySequenceEdit()
+        self.global_hotkey_edit.setMaximumSequenceLength(1)
+        self.global_hotkey_edit.setKeySequence(
+            QKeySequence.fromString(
+                self.config.get("global_hotkey", ""),
+                QKeySequence.PortableText,
+            )
+        )
+        self.clear_global_hotkey_btn = QPushButton("Desactivar atajo")
+        shortcuts_form.addRow(
+            "Mostrar/ocultar ventana:",
+            self.global_hotkey_edit,
+        )
+        shortcuts_form.addRow(self.clear_global_hotkey_btn)
+        shortcuts_layout.addLayout(shortcuts_form)
+        self.global_hotkey_status = QLabel()
+        self.global_hotkey_status.setWordWrap(True)
+        shortcuts_layout.addWidget(self.global_hotkey_status)
+        shortcuts_note = QLabel(
+            "El atajo usa KGlobalAccel de KDE en Wayland. Déjalo vacío para "
+            "desactivarlo; --show seguirá disponible como recuperación."
+        )
+        shortcuts_note.setWordWrap(True)
+        shortcuts_layout.addWidget(shortcuts_note)
+        shortcuts_layout.addStretch()
+        self.preferences_tabs.addTab(shortcuts_tab, "Atajos")
+        self.global_hotkey_edit.editingFinished.connect(
+            self.save_global_hotkey
+        )
+        self.clear_global_hotkey_btn.clicked.connect(
+            self.clear_global_hotkey
+        )
+
         activity_box = QGroupBox("Detección global de inactividad")
         activity_lay = QVBoxLayout(activity_box)
         self.input_monitor_check = QCheckBox("Detectar mouse, teclado, touchpad, joystick y mandos mediante evdev")
@@ -1623,11 +1946,17 @@ class MainWindow(QMainWindow):
         self.activity_label = QLabel("Inicializando monitor de entrada…")
         self.activity_label.setWordWrap(True)
         activity_lay.addWidget(self.input_monitor_check); activity_lay.addWidget(self.activity_label)
-        settings_layout.addWidget(activity_box)
+        behavior_layout.addWidget(activity_box)
         self.input_monitor_check.toggled.connect(self.toggle_input_monitor)
-
-        settings_layout.addStretch()
-        tabs.addTab(settings_tab, "Ajustes")
+        cancel_note = QLabel(
+            "El comando opcional ante cancelación se configura por "
+            "programación en su pestaña Acción. Posponer no lo ejecuta."
+        )
+        cancel_note.setWordWrap(True)
+        behavior_layout.addWidget(cancel_note)
+        behavior_layout.addStretch()
+        self.preferences_tabs.addTab(behavior_tab, "Comportamiento")
+        self.main_tabs.addTab(settings_tab, "Preferencias")
 
         update_tab = QWidget()
         update_layout = QVBoxLayout(update_tab)
@@ -1670,7 +1999,7 @@ class MainWindow(QMainWindow):
         tip.setWordWrap(True)
         update_layout.addWidget(tip)
         update_layout.addStretch()
-        tabs.addTab(update_tab, "Actualizaciones")
+        self.main_tabs.addTab(update_tab, "Actualizaciones")
 
         self.auto_updates.toggled.connect(self.save_settings)
         self.notify_updates.toggled.connect(self.save_settings)
@@ -1689,7 +2018,7 @@ class MainWindow(QMainWindow):
         )
         info_layout.addWidget(self.info)
         info_layout.addStretch()
-        tabs.addTab(info_tab, "Información")
+        self.main_tabs.addTab(info_tab, "Información")
 
         self.refresh_list()
         self.refresh_update_ui()
@@ -1706,6 +2035,12 @@ class MainWindow(QMainWindow):
         self.app.screenRemoved.connect(lambda _screen: self.ensure_display_position())
         if display_options.enabled:
             self.show_compact_display()
+        self.global_shortcut = GlobalShortcutManager(self)
+        self.global_shortcut.activated.connect(self.toggle_main_window)
+        self.global_shortcut.status_changed.connect(
+            self._on_global_shortcut_status
+        )
+        self.apply_global_hotkey(notify_failure=False)
         self._start_input_monitor()
         self.activity_ui_timer = QTimer(self)
         self.activity_ui_timer.timeout.connect(self.refresh_activity_label)
@@ -1882,6 +2217,8 @@ class MainWindow(QMainWindow):
             "pre_action_wait": True,
             "pre_action_timeout_seconds": 60,
             "pre_action_failure_policy": "cancel",
+            "cancel_action_behavior": "none",
+            "cancel_action_command": "",
         }
         for schedule in schedules:
             configured = {
@@ -2039,6 +2376,7 @@ class MainWindow(QMainWindow):
     def save_settings(self):
         self.config["start_minimized"] = self.start_min.isChecked()
         self.config["close_to_tray"] = self.close_tray.isChecked()
+        self.config["tray_visible"] = self.tray_visible.isChecked()
         self.config["notifications"] = self.notifications.isChecked()
         self.config["sound"] = self.sound.isChecked()
         if hasattr(self, "input_monitor_check"):
@@ -2051,6 +2389,112 @@ class MainWindow(QMainWindow):
             self.config["notify_updates"] = self.notify_updates.isChecked()
             self.config["update_manifest_url"] = self.manifest_url.text().strip()
         save_json(CONFIG_FILE, self.config)
+
+    def set_tray_visible(self, visible):
+        visible = bool(visible)
+        if not visible and not self._window_recovery_available():
+            self.tray_visible.blockSignals(True)
+            self.tray_visible.setChecked(True)
+            self.tray_visible.blockSignals(False)
+            self.config["tray_visible"] = True
+            self.tray.setVisible(True)
+            save_json(CONFIG_FILE, self.config)
+            QMessageBox.warning(
+                self,
+                "No se ocultó la bandeja",
+                "No hay un atajo global activo y el canal de recuperación "
+                "--show no está disponible. La bandeja permanecerá visible.",
+            )
+            return False
+        if self.tray_visible.isChecked() != visible:
+            self.tray_visible.blockSignals(True)
+            self.tray_visible.setChecked(visible)
+            self.tray_visible.blockSignals(False)
+        self.config["tray_visible"] = visible
+        self.tray.setVisible(visible)
+        save_json(CONFIG_FILE, self.config)
+        return True
+
+    def _window_recovery_available(self):
+        manager = getattr(self, "global_shortcut", None)
+        if manager is not None and getattr(manager, "is_registered", False):
+            return True
+        ipc = getattr(self, "_ipc", None)
+        server = getattr(ipc, "server", None)
+        return bool(server is not None and server.isListening())
+
+    def apply_global_hotkey(self, notify_failure=True):
+        configured = str(self.config.get("global_hotkey", "") or "").strip()
+        shortcut = QKeySequence.fromString(
+            configured,
+            QKeySequence.PortableText,
+        ).toString(QKeySequence.PortableText)
+        registration_value = shortcut or configured
+        try:
+            registered = self.global_shortcut.set_shortcut(registration_value)
+        except Exception as exc:
+            registered = False
+            self.global_shortcut.last_error = str(exc)
+
+        if not configured:
+            self.global_hotkey_status.setText("Atajo global desactivado.")
+            return True
+        if registered:
+            self.global_hotkey_status.setText(
+                f"Atajo global activo: {shortcut}"
+            )
+            return True
+
+        error = self.global_shortcut.last_error or "Error desconocido."
+        self.global_hotkey_status.setText(
+            f"No se pudo activar el atajo: {error}"
+        )
+        display_shortcut = shortcut or configured
+        log(
+            "No se pudo registrar el atajo global "
+            f"{display_shortcut}: {error}"
+        )
+        if notify_failure:
+            QMessageBox.warning(
+                self,
+                "Atajo global no disponible",
+                f"No se pudo registrar {display_shortcut}.\n\n{error}\n\n"
+                "Puedes seguir abriendo la ventana con "
+                "amp-autopower --show.",
+            )
+        return False
+
+    def _on_global_shortcut_status(self, active, error):
+        configured = str(self.config.get("global_hotkey", "") or "").strip()
+        if active:
+            self.global_hotkey_status.setText(
+                f"Atajo global activo: {configured}"
+            )
+        elif error:
+            self.global_hotkey_status.setText(
+                f"No se pudo activar el atajo: {error}"
+            )
+        else:
+            self.global_hotkey_status.setText("Atajo global desactivado.")
+        if (
+            not active
+            and hasattr(self, "_ipc")
+            and not self.config.get("tray_visible", True)
+            and not self._window_recovery_available()
+        ):
+            self.set_tray_visible(True)
+
+    def save_global_hotkey(self):
+        shortcut = self.global_hotkey_edit.keySequence().toString(
+            QKeySequence.PortableText
+        )
+        self.config["global_hotkey"] = shortcut
+        save_json(CONFIG_FILE, self.config)
+        self.apply_global_hotkey()
+
+    def clear_global_hotkey(self):
+        self.global_hotkey_edit.clear()
+        self.save_global_hotkey()
 
     def current_display_options(self):
         if not hasattr(self, "display_enabled"):
@@ -3136,12 +3580,55 @@ class MainWindow(QMainWindow):
         if result == "cancel":
             self.mark_skipped(s, target)
             self.notify("Acción cancelada", f"«{s.name}» fue cancelada para esta ocasión.")
+            if (
+                getattr(dlg, "cancelled_by_user", False)
+                and not getattr(dlg, "cancel_command_executed", False)
+            ):
+                dlg.cancel_command_executed = True
+                self._run_cancel_action_command(s)
         elif result == "snooze10":
             self.snooze(s, 10, target)
         elif result == "snooze30":
             self.snooze(s, 30, target)
         else:
             self.execute_action(s, target)
+
+    def _run_cancel_action_command(self, s):
+        if getattr(s, "cancel_action_behavior", "none") != "command":
+            return False
+        command = getattr(s, "cancel_action_command", "").strip()
+        try:
+            args = shlex.split(command)
+        except ValueError as exc:
+            error = f"El comando al cancelar no es válido: {exc}"
+            log(error)
+            self.notify("No se ejecutó el comando al cancelar", error, True)
+            return False
+        if not args:
+            error = "No se configuró ningún comando al cancelar."
+            log(error)
+            self.notify("No se ejecutó el comando al cancelar", error, True)
+            return False
+
+        try:
+            started = QProcess.startDetached(args[0], args[1:])
+            if isinstance(started, tuple):
+                started = started[0]
+        except Exception as exc:
+            log(f"No se pudo iniciar el comando al cancelar: {exc}")
+            self.notify(
+                "No se ejecutó el comando al cancelar",
+                str(exc),
+                True,
+            )
+            return False
+        if not started:
+            error = f"No se pudo iniciar «{args[0]}»."
+            log(error)
+            self.notify("No se ejecutó el comando al cancelar", error, True)
+            return False
+        log("Ejecutando comando al cancelar: " + " ".join(args))
+        return True
 
     def mark_skipped(self, s, target):
         self.state.setdefault("last_runs", {})[s.id] = target.isoformat() + ":skipped"
@@ -3609,6 +4096,7 @@ class MainWindow(QMainWindow):
             "kill_timer": None,
             "timed_out": False,
             "cancelled": False,
+            "cancel_action_executed": False,
             "timeout_seconds": timeout_seconds,
         }
         process.finished.connect(
@@ -3824,7 +4312,10 @@ class MainWindow(QMainWindow):
             if getattr(dlg, "schedule", None) is not None
         ]
         if active:
-            min(active, key=lambda dlg: dlg.remaining).finish("cancel")
+            min(active, key=lambda dlg: dlg.remaining).finish(
+                "cancel",
+                user_requested=True,
+            )
             return
 
         pre_actions = list(
@@ -3836,6 +4327,9 @@ class MainWindow(QMainWindow):
             target = context["target"]
             self._cancel_pre_action(context["process"])
             self.mark_skipped(s, target)
+            if not context.get("cancel_action_executed", False):
+                context["cancel_action_executed"] = True
+                self._run_cancel_action_command(s)
             self.notify(
                 "Acción cancelada",
                 f"«{s.name}» fue cancelada mientras se ejecutaba el "
@@ -3863,6 +4357,7 @@ class MainWindow(QMainWindow):
             return
         due, s, target = min(candidates, key=lambda x: x[0])
         self.mark_skipped(s, target)
+        self._run_cancel_action_command(s)
         self.notify(
             "Próxima acción cancelada",
             f"{s.name} "
@@ -4248,11 +4743,18 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
+    def toggle_main_window(self):
+        if self.isVisible() and not self.isMinimized():
+            self.hide()
+        else:
+            self.show_normal()
+
     def closeEvent(self, event: QCloseEvent):
         if self.config.get("close_to_tray", True):
             event.ignore()
             self.hide()
-            self.tray.showMessage(APP_NAME, "Sigue funcionando en la bandeja.", QSystemTrayIcon.Information, 3000)
+            if self.config.get("tray_visible", True):
+                self.tray.showMessage(APP_NAME, "Sigue funcionando en la bandeja.", QSystemTrayIcon.Information, 3000)
         else:
             event.accept()
 
@@ -4263,6 +4765,8 @@ class MainWindow(QMainWindow):
             self.compact_display.hide()
         if self.input_monitor and self.input_monitor.isRunning():
             self.input_monitor.requestInterruption(); self.input_monitor.wait(1200)
+        if hasattr(self, "global_shortcut"):
+            self.global_shortcut.disable()
         self.tray.hide()
         QApplication.quit()
 
@@ -4328,6 +4832,8 @@ def main():
     window = MainWindow(app)
     ipc = IpcServer(window)
     window._ipc = ipc
+    if not window.config.get("tray_visible", True):
+        window.set_tray_visible(False)
     if not window.config.get("start_minimized", True) or "--show" in sys.argv:
         window.show()
     else:

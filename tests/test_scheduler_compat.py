@@ -34,6 +34,8 @@ class SchedulerHarness:
     _kill_timed_out_pre_action = MainWindow._kill_timed_out_pre_action
     _run_pre_action = MainWindow._run_pre_action
     execute_action = MainWindow.execute_action
+    on_countdown_finished = MainWindow.on_countdown_finished
+    _run_cancel_action_command = MainWindow._run_cancel_action_command
     _find_qdbus = MainWindow._find_qdbus
     _session_action_command = MainWindow._session_action_command
     _run_final_command = MainWindow._run_final_command
@@ -269,6 +271,8 @@ class SchedulerCompatibilityTests(unittest.TestCase):
             self.assertNotIn("condition_logic", serialized)
             self.assertNotIn("pre_action_enabled", serialized)
             self.assertNotIn("pre_action_command", serialized)
+            self.assertNotIn("cancel_action_behavior", serialized)
+            self.assertNotIn("cancel_action_command", serialized)
 
         serialized_or = schedule_to_dict(Schedule(id="or", condition_logic="OR"))
         self.assertNotIn("condition_logic", serialized_or)
@@ -1723,6 +1727,8 @@ class SchedulerCompatibilityTests(unittest.TestCase):
             pre_action_wait=False,
             pre_action_timeout_seconds=90,
             pre_action_failure_policy="continue",
+            cancel_action_behavior="command",
+            cancel_action_command='"/tmp/Cancel Tool" --undo',
         )
 
         with patch("amp_autopower.save_json"):
@@ -1748,6 +1754,8 @@ class SchedulerCompatibilityTests(unittest.TestCase):
                 "pre_action_wait": False,
                 "pre_action_timeout_seconds": 90,
                 "pre_action_failure_policy": "continue",
+                "cancel_action_behavior": "command",
+                "cancel_action_command": '"/tmp/Cancel Tool" --undo',
             },
         )
         restored = harness.schedules()[0]
@@ -1756,6 +1764,11 @@ class SchedulerCompatibilityTests(unittest.TestCase):
         self.assertFalse(restored.pre_action_wait)
         self.assertEqual(restored.pre_action_timeout_seconds, 90)
         self.assertEqual(restored.pre_action_failure_policy, "continue")
+        self.assertEqual(restored.cancel_action_behavior, "command")
+        self.assertEqual(
+            restored.cancel_action_command,
+            '"/tmp/Cancel Tool" --undo',
+        )
 
         with patch("amp_autopower.save_json"):
             harness.set_schedules(
@@ -2410,6 +2423,227 @@ class SchedulerCompatibilityTests(unittest.TestCase):
             self.assertTrue(harness._close_chrome_cleanly())
 
         kill.assert_called_once_with(1234, signal.SIGHUP)
+
+    def test_cancel_command_disabled_does_nothing(self):
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        target = datetime(2026, 8, 31, 12, 0)
+        item = Schedule(
+            id="cancel-disabled",
+            action="test",
+            cancel_action_behavior="none",
+            cancel_action_command="/usr/bin/example",
+        )
+        dialog = SimpleNamespace(
+            result_action="cancel",
+            cancelled_by_user=True,
+            cancel_command_executed=False,
+        )
+
+        with (
+            patch("amp_autopower.QProcess.startDetached") as command,
+            patch("amp_autopower.save_json"),
+        ):
+            harness.on_countdown_finished("cancel", dialog, item, target)
+
+        command.assert_not_called()
+
+    def test_explicit_cancel_runs_command_once_with_safe_arguments(self):
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        target = datetime(2026, 8, 31, 12, 0)
+        item = Schedule(
+            id="cancel-command",
+            action="test",
+            cancel_action_behavior="command",
+            cancel_action_command='"/tmp/Cancel Tool" --undo "two words"',
+        )
+        dialog = SimpleNamespace(
+            result_action="cancel",
+            cancelled_by_user=True,
+            cancel_command_executed=False,
+        )
+
+        with (
+            patch(
+                "amp_autopower.QProcess.startDetached",
+                return_value=(True, 1234),
+            ) as command,
+            patch("amp_autopower.save_json"),
+        ):
+            harness.on_countdown_finished("cancel", dialog, item, target)
+            harness.on_countdown_finished("cancel", dialog, item, target)
+
+        command.assert_called_once_with(
+            "/tmp/Cancel Tool",
+            ["--undo", "two words"],
+        )
+
+    def test_snooze_does_not_run_cancel_command(self):
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        target = datetime(2026, 8, 31, 12, 0)
+        item = Schedule(
+            id="snooze",
+            action="test",
+            cancel_action_behavior="command",
+            cancel_action_command="/usr/bin/example",
+        )
+        dialog = SimpleNamespace(
+            result_action="snooze10",
+            cancelled_by_user=False,
+            cancel_command_executed=False,
+        )
+
+        with (
+            patch("amp_autopower.QProcess.startDetached") as command,
+            patch("amp_autopower.save_json"),
+        ):
+            harness.on_countdown_finished("snooze", dialog, item, target)
+
+        command.assert_not_called()
+
+    def test_internal_cancel_does_not_run_cancel_command(self):
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        target = datetime(2026, 8, 31, 12, 0)
+        item = Schedule(
+            id="internal-cancel",
+            action="test",
+            cancel_action_behavior="command",
+            cancel_action_command="/usr/bin/example",
+        )
+        dialog = SimpleNamespace(
+            result_action="cancel",
+            cancelled_by_user=False,
+            cancel_command_executed=False,
+        )
+
+        with (
+            patch("amp_autopower.QProcess.startDetached") as command,
+            patch("amp_autopower.save_json"),
+        ):
+            harness.on_countdown_finished("internal", dialog, item, target)
+
+        command.assert_not_called()
+
+    def test_cancel_command_failure_does_not_escape(self):
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        item = Schedule(
+            cancel_action_behavior="command",
+            cancel_action_command="/does/not/exist",
+        )
+
+        with patch(
+            "amp_autopower.QProcess.startDetached",
+            side_effect=OSError("simulated failure"),
+        ):
+            self.assertFalse(harness._run_cancel_action_command(item))
+
+        self.assertIn("simulated failure", harness.notifications[-1][0][1])
+
+    def test_pre_action_failure_does_not_run_cancel_command(self):
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        harness._run_cancel_action_command = MagicMock()
+        item = Schedule(
+            id="pre-failure",
+            cancel_action_behavior="command",
+            cancel_action_command="/usr/bin/example",
+        )
+
+        with patch("amp_autopower.save_json"):
+            harness._handle_pre_action_failure(
+                item,
+                datetime(2026, 8, 31, 12, 0),
+                "simulated pre-action failure",
+            )
+
+        harness._run_cancel_action_command.assert_not_called()
+
+    def test_disabling_or_deleting_schedule_does_not_run_cancel_command(self):
+        target = datetime(2026, 8, 31, 12, 0)
+
+        for replacement in (
+            [Schedule(id="scheduled", enabled=False)],
+            [],
+        ):
+            with self.subTest(deleted=not replacement):
+                state = {
+                    "last_runs": {},
+                    "snoozes": {},
+                    "skipped_targets": {},
+                    "pending_occurrences": {},
+                    "completed_intervals": {},
+                }
+                harness = SchedulerHarness(state)
+                item = Schedule(
+                    id="scheduled",
+                    action="test",
+                    cancel_action_behavior="command",
+                    cancel_action_command="/usr/bin/example",
+                )
+                harness.config["schedules"] = [schedule_to_dict(item)]
+
+                class InternalDialog:
+                    schedule = item
+
+                    def finish(dialog_self, action):
+                        dialog_self.result_action = action
+                        dialog_self.cancelled_by_user = False
+                        dialog_self.cancel_command_executed = False
+                        harness.on_countdown_finished(
+                            "active",
+                            dialog_self,
+                            item,
+                            target,
+                        )
+
+                harness.active_dialogs["active"] = InternalDialog()
+                with (
+                    patch("amp_autopower.QProcess.startDetached") as command,
+                    patch("amp_autopower.save_json"),
+                ):
+                    harness.set_schedules(replacement, now=target)
+
+                command.assert_not_called()
 
     def test_timed_or_cpu_starts_countdown_before_time_window(self):
         now = datetime(2026, 8, 31, 23, 20)

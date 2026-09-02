@@ -210,6 +210,8 @@ class ScheduleEditorTabsTests(unittest.TestCase):
         self.assertTrue(saved.pre_action_wait)
         self.assertEqual(saved.pre_action_timeout_seconds, 60)
         self.assertEqual(saved.pre_action_failure_policy, "cancel")
+        self.assertEqual(saved.cancel_action_behavior, "none")
+        self.assertEqual(saved.cancel_action_command, "")
 
     def test_pre_action_controls_and_full_round_trip(self):
         source = Schedule(
@@ -223,6 +225,8 @@ class ScheduleEditorTabsTests(unittest.TestCase):
             pre_action_wait=True,
             pre_action_timeout_seconds=125,
             pre_action_failure_policy="continue",
+            cancel_action_behavior="command",
+            cancel_action_command='"/tmp/Cancel Tool" --undo',
         )
         editor = self.editor(source)
 
@@ -231,6 +235,7 @@ class ScheduleEditorTabsTests(unittest.TestCase):
         self.assertTrue(editor.pre_action_timeout.isEnabled())
         self.assertTrue(editor.pre_action_failure_policy.isEnabled())
         self.assertFalse(editor.close_apps.isEnabled())
+        self.assertTrue(editor.cancel_action_command.isEnabled())
         self.assertEqual(asdict(editor.get_schedule()), asdict(source))
 
         editor.pre_action_wait.setChecked(False)
@@ -239,6 +244,10 @@ class ScheduleEditorTabsTests(unittest.TestCase):
         self.assertFalse(editor.pre_action_command.isEnabled())
         self.assertFalse(editor.pre_action_wait.isEnabled())
         self.assertFalse(editor.pre_action_failure_policy.isEnabled())
+        editor.cancel_action_behavior.setCurrentIndex(
+            editor.cancel_action_behavior.findData("none")
+        )
+        self.assertFalse(editor.cancel_action_command.isEnabled())
 
     def test_pre_action_browse_quotes_paths_with_spaces(self):
         editor = self.editor(Schedule(pre_action_enabled=True))
@@ -250,6 +259,22 @@ class ScheduleEditorTabsTests(unittest.TestCase):
             editor.pre_action_browse.click()
 
         self.assertEqual(editor.pre_action_command.text(), "'/tmp/My Tool'")
+
+    def test_cancel_action_browse_quotes_paths_with_spaces(self):
+        editor = self.editor(
+            Schedule(cancel_action_behavior="command")
+        )
+
+        with patch(
+            "amp_autopower.QFileDialog.getOpenFileName",
+            return_value=("/tmp/Cancel Tool", ""),
+        ):
+            editor.cancel_action_browse.click()
+
+        self.assertEqual(
+            editor.cancel_action_command.text(),
+            "'/tmp/Cancel Tool'",
+        )
 
     def test_tabs_follow_application_palette(self):
         original = self.app.palette()
