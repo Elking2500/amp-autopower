@@ -27,16 +27,26 @@ from amp_autopower import (
 class FakeSocket:
     def __init__(self, command):
         self.command = command
-        self.disconnected = False
+        self.was_disconnected = False
+        self.readyRead = FakeSignal()
+        self.disconnected = FakeSignal()
 
     def waitForReadyRead(self, _timeout):
         return True
 
     def readAll(self):
-        return self.command.encode("utf-8")
+        command = self.command.encode("utf-8")
+        self.command = ""
+        return command
+
+    def bytesAvailable(self):
+        return len(self.command.encode("utf-8"))
 
     def disconnectFromServer(self):
-        self.disconnected = True
+        self.was_disconnected = True
+
+    def deleteLater(self):
+        pass
 
 
 class FakeSignal:
@@ -181,6 +191,8 @@ class GlobalPreferencesTests(unittest.TestCase):
         window = SimpleNamespace(show_normal=MagicMock())
         ipc = IpcServer.__new__(IpcServer)
         ipc.window = window
+        ipc._buffers = {}
+        ipc._connection_timers = {}
         ipc.server = SimpleNamespace(
             nextPendingConnection=lambda: socket,
         )
@@ -188,7 +200,7 @@ class GlobalPreferencesTests(unittest.TestCase):
         ipc.handle_connection()
 
         window.show_normal.assert_called_once_with()
-        self.assertTrue(socket.disconnected)
+        self.assertTrue(socket.was_disconnected)
 
     def test_disabled_hotkey_does_not_attempt_registration(self):
         window = self.window(global_hotkey="")

@@ -5,7 +5,13 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from amp_autopower import MainWindow, Schedule, schedule_to_dict
+from amp_autopower import (
+    CONFIG_FILE,
+    STATE_FILE,
+    MainWindow,
+    Schedule,
+    schedule_to_dict,
+)
 from condition_engine import (
     CPUReading,
     ConditionEngine,
@@ -51,6 +57,7 @@ class SchedulerHarness:
     cancel_next_run = MainWindow.cancel_next_run
     snooze = MainWindow.snooze
     set_schedules = MainWindow.set_schedules
+    set_schedule_enabled = MainWindow.set_schedule_enabled
     mark_skipped = MainWindow.mark_skipped
 
     def __init__(
@@ -583,6 +590,205 @@ class SchedulerCompatibilityTests(unittest.TestCase):
             reactivated_at + timedelta(minutes=45),
         )
         self.assertNotIn(item.id, state["completed_intervals"])
+
+    def test_cli_disable_interval_uses_central_cleanup(self):
+        now = datetime(2026, 8, 31, 12, 0)
+        item = Schedule(
+            id="cli-interval",
+            name="CLI interval",
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=45,
+            weekdays=[],
+        )
+        state = {
+            "last_runs": {},
+            "snoozes": {item.id: (now + timedelta(minutes=10)).isoformat()},
+            "skipped_targets": {},
+            "pending_occurrences": {
+                item.id: ScheduledOccurrence.create_interval(
+                    item.id,
+                    now - timedelta(minutes=5),
+                    45,
+                    60,
+                ).to_state(),
+            },
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        harness.config["schedules"] = [schedule_to_dict(item)]
+
+        with patch("amp_autopower.save_json") as save:
+            ok, _message, code = harness.set_schedule_enabled(
+                item.id,
+                False,
+                now=now,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(code, 0)
+        self.assertFalse(harness.schedules()[0].enabled)
+        self.assertNotIn(item.id, state["pending_occurrences"])
+        self.assertNotIn(item.id, state["snoozes"])
+        saved_paths = [call.args[0] for call in save.call_args_list]
+        self.assertIn(CONFIG_FILE, saved_paths)
+        self.assertIn(STATE_FILE, saved_paths)
+
+    def test_cli_enable_interval_starts_fresh_occurrence(self):
+        now = datetime(2026, 8, 31, 12, 0)
+        item = Schedule(
+            id="cli-interval",
+            name="CLI interval",
+            enabled=False,
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=45,
+            weekdays=[],
+        )
+        state = {
+            "last_runs": {item.id: "old-run"},
+            "snoozes": {item.id: (now + timedelta(minutes=10)).isoformat()},
+            "skipped_targets": {item.id: "old-target"},
+            "pending_occurrences": {},
+            "completed_intervals": {item.id: "completed"},
+        }
+        harness = SchedulerHarness(state)
+        harness.config["schedules"] = [schedule_to_dict(item)]
+
+        with patch("amp_autopower.save_json") as save:
+            ok, _message, code = harness.set_schedule_enabled(
+                item.name,
+                True,
+                now=now,
+            )
+
+        enabled = harness.schedules()[0]
+        occurrence = harness.pending_occurrence(enabled)
+        self.assertTrue(ok)
+        self.assertEqual(code, 0)
+        self.assertTrue(enabled.enabled)
+        self.assertEqual(occurrence.start_at, now)
+        self.assertEqual(
+            occurrence.scheduled_target,
+            now + timedelta(minutes=45),
+        )
+        for state_key in (
+            "last_runs",
+            "snoozes",
+            "skipped_targets",
+            "completed_intervals",
+        ):
+            self.assertNotIn(item.id, state[state_key])
+        saved_paths = [call.args[0] for call in save.call_args_list]
+        self.assertIn(CONFIG_FILE, saved_paths)
+        self.assertIn(STATE_FILE, saved_paths)
+
+    def test_cli_disable_timed_schedule_prunes_pending_and_snooze(self):
+        now = datetime(2026, 8, 31, 12, 0)
+        item = Schedule(id="cli-time", name="CLI time", time="13:00")
+        occurrence = ScheduledOccurrence.create(
+            item.id,
+            now + timedelta(hours=1),
+            60,
+        )
+        state = {
+            "last_runs": {},
+            "snoozes": {item.id: (now + timedelta(hours=2)).isoformat()},
+            "skipped_targets": {},
+            "pending_occurrences": {item.id: occurrence.to_state()},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        harness.config["schedules"] = [schedule_to_dict(item)]
+
+        with patch("amp_autopower.save_json"):
+            ok, _message, code = harness.set_schedule_enabled(
+                item.id,
+                False,
+                now=now,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(code, 0)
+        self.assertFalse(harness.schedules()[0].enabled)
+        self.assertNotIn(item.id, state["pending_occurrences"])
+        self.assertNotIn(item.id, state["snoozes"])
+
+    def test_cli_disable_idle_schedule_clears_snooze_and_runtime(self):
+        now = datetime(2026, 8, 31, 12, 0)
+        item = Schedule(
+            id="cli-idle",
+            name="CLI idle",
+            use_time=False,
+            trigger_mode="idle",
+            idle_minutes=20,
+        )
+        state = {
+            "last_runs": {},
+            "snoozes": {item.id: (now + timedelta(minutes=10)).isoformat()},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        harness.config["schedules"] = [schedule_to_dict(item)]
+        runtime = harness.condition_engine.runtime
+        runtime.mark_idle_cycle_triggered(item.id)
+        runtime.mark_idle_snoozed(item.id)
+
+        with patch("amp_autopower.save_json"):
+            ok, _message, code = harness.set_schedule_enabled(
+                item.id,
+                False,
+                now=now,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(code, 0)
+        self.assertNotIn(item.id, state["snoozes"])
+        self.assertFalse(runtime.idle_cycle_was_triggered(item.id))
+        self.assertNotIn(item.id, runtime._idle_snooze_generation)
+
+    def test_cli_enable_active_interval_preserves_existing_occurrence(self):
+        start = datetime(2026, 8, 31, 12, 0)
+        now = start + timedelta(minutes=5)
+        item = Schedule(
+            id="cli-active-interval",
+            name="CLI active interval",
+            use_time=False,
+            trigger_mode="interval",
+            interval_minutes=45,
+            weekdays=[],
+        )
+        occurrence = ScheduledOccurrence.create_interval(
+            item.id,
+            start,
+            45,
+            60,
+        )
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {item.id: occurrence.to_state()},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        harness.config["schedules"] = [schedule_to_dict(item)]
+
+        with patch("amp_autopower.save_json"):
+            ok, message, code = harness.set_schedule_enabled(
+                item.id,
+                True,
+                now=now,
+            )
+
+        preserved = harness.pending_occurrence(item)
+        self.assertTrue(ok)
+        self.assertEqual(code, 0)
+        self.assertIn("sin cambios", message)
+        self.assertEqual(preserved.start_at, start)
+        self.assertEqual(preserved.scheduled_target, occurrence.scheduled_target)
 
     def test_editing_interval_duration_restarts_from_save_time(self):
         original_start = datetime(2026, 8, 31, 10, 0)

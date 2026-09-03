@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import configparser
 import hashlib
 import json
@@ -18,7 +19,7 @@ import tempfile
 import urllib.parse
 import urllib.request
 import uuid
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -82,6 +83,9 @@ APP_NAME = "AMP AutoPower"
 APP_ID = "amp-autopower"
 APP_VERSION = "1.3.0"
 IPC_NAME = "amp-autopower-ipc-v1"
+IPC_TIMEOUT_MS = 2000
+IPC_MAX_REQUEST_BYTES = 16 * 1024
+IPC_MAX_RESPONSE_BYTES = 256 * 1024
 CONFIG_DIR = Path.home() / ".config" / APP_ID
 CONFIG_FILE = CONFIG_DIR / "config.json"
 STATE_FILE = CONFIG_DIR / "state.json"
@@ -533,6 +537,248 @@ DEFAULT_STATE = {
     "last_update_check": None,
     "available_update": None,
 }
+
+
+def schedules_from_config(config):
+    schedules = []
+    cpu_settings = config.get("cpu_settings", {})
+    network_settings = config.get("network_settings", {})
+    logic_settings = config.get("condition_logic_settings", {})
+    action_settings = config.get("action_settings", {})
+    for raw in config.get("schedules", []):
+        try:
+            data = dict(raw)
+            schedule_id = data.get("id")
+            for settings in (cpu_settings, network_settings, action_settings):
+                preset = settings.get(schedule_id, {})
+                if isinstance(preset, dict):
+                    for key, value in preset.items():
+                        data.setdefault(key, value)
+            data.setdefault(
+                "condition_logic",
+                logic_settings.get(schedule_id, "AND"),
+            )
+            schedules.append(Schedule(**data))
+        except Exception as exc:
+            log(f"Programación inválida ignorada: {exc}")
+    return schedules
+
+
+def _pending_occurrence_from_state(schedule, state):
+    raw = state.get("pending_occurrences", {}).get(schedule.id)
+    if not raw:
+        return None
+    try:
+        return ScheduledOccurrence.from_state(schedule.id, raw)
+    except Exception:
+        return None
+
+
+def _pending_action_time_from_state(schedule, occurrence, state, now):
+    internal_due = None
+    if occurrence.next_check_at:
+        if occurrence.next_check_at <= occurrence.scheduled_target:
+            internal_due = occurrence.scheduled_target
+        else:
+            internal_due = occurrence.next_check_at + timedelta(
+                seconds=int(schedule.final_countdown_seconds)
+            )
+
+    snooze_iso = state.get("snoozes", {}).get(schedule.id)
+    if snooze_iso:
+        try:
+            snooze_due = datetime.fromisoformat(snooze_iso)
+            return max(snooze_due, internal_due or snooze_due)
+        except (TypeError, ValueError):
+            pass
+    if internal_due:
+        return internal_due
+    if occurrence.scheduled_target > now:
+        return occurrence.scheduled_target
+    return now + timedelta(seconds=int(schedule.final_countdown_seconds))
+
+
+def schedule_next_target(schedule, state, now=None):
+    if not schedule.enabled:
+        return None
+    now = now or datetime.now()
+    occurrence = _pending_occurrence_from_state(schedule, state)
+    if occurrence is not None:
+        return _pending_action_time_from_state(schedule, occurrence, state, now)
+    if schedule_trigger_mode(schedule) != "time":
+        return None
+
+    snooze_iso = state.get("snoozes", {}).get(schedule.id)
+    if snooze_iso:
+        try:
+            snooze_due = datetime.fromisoformat(snooze_iso)
+            if snooze_due >= now:
+                return snooze_due
+        except (TypeError, ValueError):
+            pass
+    try:
+        hour, minute = map(int, schedule.time.split(":"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    skipped_iso = state.get("skipped_targets", {}).get(schedule.id)
+    last_run_iso = state.get("last_runs", {}).get(schedule.id)
+    for delta in range(8):
+        day = now.date() + timedelta(days=delta)
+        candidate = datetime.combine(day, datetime.min.time()).replace(
+            hour=hour,
+            minute=minute,
+        )
+        if candidate.weekday() not in schedule.weekdays or candidate < now:
+            continue
+        if candidate.isoformat() in (skipped_iso, last_run_iso):
+            continue
+        return candidate
+    return None
+
+
+def _cli_text(value):
+    return " ".join(str(value).split())
+
+
+def _cli_mode_text(schedule):
+    mode = schedule_trigger_mode(schedule)
+    if mode == "time":
+        return f"hora {schedule.time}"
+    if mode == "interval":
+        return f"intervalo {format_interval(schedule.interval_minutes)}"
+    return f"inactividad {schedule.idle_minutes} min"
+
+
+def format_schedules_cli(schedules, state, now=None):
+    if not schedules:
+        return "No hay programaciones."
+    now = now or datetime.now()
+    lines = []
+    for schedule in schedules:
+        target = schedule_next_target(schedule, state, now)
+        target_text = target.isoformat(timespec="minutes") if target else "-"
+        lines.append(
+            f"ID={schedule.id} | "
+            f"Estado={'activa' if schedule.enabled else 'inactiva'} | "
+            f"Nombre={_cli_text(schedule.name)} | "
+            f"Acción={ACTIONS.get(schedule.action, schedule.action)} | "
+            f"Modo={_cli_mode_text(schedule)} | "
+            f"Próximo={target_text}"
+        )
+    return "\n".join(lines)
+
+
+def format_status_cli(
+    config,
+    state,
+    schedules,
+    ipc_available,
+    display_visible=False,
+    tray_visible=False,
+    now=None,
+):
+    now = now or datetime.now()
+    candidates = []
+    for schedule in schedules:
+        target = schedule_next_target(schedule, state, now)
+        if target is not None:
+            candidates.append((target, schedule))
+    if candidates:
+        target, schedule = min(candidates, key=lambda item: item[0])
+        next_action = (
+            f"{ACTIONS.get(schedule.action, schedule.action)} | "
+            f"{_cli_text(schedule.name)} | "
+            f"{target.isoformat(timespec='minutes')}"
+        )
+    else:
+        next_action = "ninguna"
+    active_count = sum(1 for schedule in schedules if schedule.enabled)
+    return "\n".join(
+        (
+            f"Versión: {APP_VERSION}",
+            f"IPC accesible: {'sí' if ipc_available else 'no'}",
+            f"Programaciones: {len(schedules)} total, {active_count} activas",
+            f"Próxima acción: {next_action}",
+            f"Display compacto: {'visible' if display_visible else 'oculto'}",
+            f"Bandeja: {'visible' if tray_visible else 'oculta'}",
+        )
+    )
+
+
+def resolve_schedule(schedules, selector):
+    selector = str(selector or "").strip()
+    if not selector:
+        return None, "Debes indicar un ID o nombre.", 2
+    by_id = next((schedule for schedule in schedules if schedule.id == selector), None)
+    if by_id is not None:
+        return by_id, "", 0
+    by_name = [schedule for schedule in schedules if schedule.name == selector]
+    if len(by_name) == 1:
+        return by_name[0], "", 0
+    if len(by_name) > 1:
+        ids = ", ".join(schedule.id for schedule in by_name)
+        return None, f"Nombre ambiguo «{selector}». Usa un ID: {ids}", 2
+    return None, f"No existe una programación con ID o nombre «{selector}».", 1
+
+
+def build_cli_parser():
+    parser = argparse.ArgumentParser(
+        prog="amp-autopower",
+        description="Administra la instancia local de AMP AutoPower.",
+    )
+    commands = parser.add_mutually_exclusive_group()
+    commands.add_argument("--show", action="store_true", help="Muestra la ventana.")
+    commands.add_argument("--hide", action="store_true", help="Oculta la ventana.")
+    commands.add_argument(
+        "--toggle",
+        action="store_true",
+        help="Alterna la visibilidad de la ventana.",
+    )
+    commands.add_argument(
+        "--status",
+        action="store_true",
+        help="Muestra un resumen del estado.",
+    )
+    commands.add_argument(
+        "--list-schedules",
+        action="store_true",
+        help="Lista las programaciones.",
+    )
+    commands.add_argument(
+        "--enable",
+        metavar="ID_O_NOMBRE",
+        help="Activa una programación por ID o nombre exacto.",
+    )
+    commands.add_argument(
+        "--disable",
+        metavar="ID_O_NOMBRE",
+        help="Desactiva una programación por ID o nombre exacto.",
+    )
+    commands.add_argument(
+        "--check-update",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=APP_VERSION,
+        help="Muestra la versión y termina.",
+    )
+    return parser
+
+
+def cli_command_from_args(args):
+    for option in ("show", "hide", "toggle", "status", "list_schedules"):
+        if getattr(args, option):
+            return option.replace("_", "-"), None
+    if args.enable is not None:
+        return "enable", args.enable
+    if args.disable is not None:
+        return "disable", args.disable
+    if args.check_update:
+        return "check-update", None
+    return None, None
 
 
 def load_json(path: Path, default):
@@ -2053,34 +2299,70 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(6000, self.maybe_auto_check_updates)
 
     def schedules(self):
-        out = []
-        cpu_settings = self.config.get("cpu_settings", {})
-        network_settings = self.config.get("network_settings", {})
-        logic_settings = self.config.get("condition_logic_settings", {})
-        action_settings = self.config.get("action_settings", {})
-        for raw in self.config.get("schedules", []):
-            try:
-                data = dict(raw)
-                preset = cpu_settings.get(data.get("id"), {})
-                if isinstance(preset, dict):
-                    for key, value in preset.items():
-                        data.setdefault(key, value)
-                network_preset = network_settings.get(data.get("id"), {})
-                if isinstance(network_preset, dict):
-                    for key, value in network_preset.items():
-                        data.setdefault(key, value)
-                data.setdefault(
-                    "condition_logic",
-                    logic_settings.get(data.get("id"), "AND"),
-                )
-                action_preset = action_settings.get(data.get("id"), {})
-                if isinstance(action_preset, dict):
-                    for key, value in action_preset.items():
-                        data.setdefault(key, value)
-                out.append(Schedule(**data))
-            except Exception as e:
-                log(f"Programación inválida ignorada: {e}")
-        return out
+        return schedules_from_config(self.config)
+
+    def set_schedule_enabled(self, selector, enabled, now=None):
+        schedules = self.schedules()
+        target, error, code = resolve_schedule(schedules, selector)
+        if target is None:
+            return False, error, code
+
+        enabled = bool(enabled)
+        changed = target.enabled != enabled
+        updated = replace(target, enabled=enabled)
+        schedules = [updated if item.id == target.id else item for item in schedules]
+        restart_ids = None
+        if changed and enabled and schedule_trigger_mode(updated) == "interval":
+            restart_ids = {updated.id}
+        self.set_schedules(
+            schedules,
+            restart_interval_ids=restart_ids,
+            now=now,
+        )
+        state = "activada" if enabled else "desactivada"
+        qualifier = "" if changed else " (sin cambios)"
+        return (
+            True,
+            f"Programación {state}: {_cli_text(updated.name)} "
+            f"[{updated.id}]{qualifier}",
+            0,
+        )
+
+    def handle_cli_command(self, command, target=None):
+        if command == "show":
+            self.show_normal()
+            return {"ok": True, "code": 0, "output": "Ventana mostrada."}
+        if command == "hide":
+            self.hide()
+            return {"ok": True, "code": 0, "output": "Ventana oculta."}
+        if command == "toggle":
+            self.toggle_main_window()
+            return {"ok": True, "code": 0, "output": "Visibilidad alternada."}
+        if command == "status":
+            schedules = self.schedules()
+            output = format_status_cli(
+                self.config,
+                self.state,
+                schedules,
+                ipc_available=True,
+                display_visible=self.compact_display.isVisible(),
+                tray_visible=self.tray.isVisible(),
+            )
+            return {"ok": True, "code": 0, "output": output}
+        if command == "list-schedules":
+            output = format_schedules_cli(self.schedules(), self.state)
+            return {"ok": True, "code": 0, "output": output}
+        if command in ("enable", "disable"):
+            ok, output, code = self.set_schedule_enabled(
+                target,
+                command == "enable",
+            )
+            return {"ok": ok, "code": code, "output": output}
+        return {
+            "ok": False,
+            "code": 2,
+            "output": f"Comando IPC no válido: {_cli_text(command)}",
+        }
 
     def set_schedules(self, schedules, restart_interval_ids=None, now=None):
         previous_by_id = {s.id: s for s in self.schedules()}
@@ -2139,6 +2421,24 @@ class MainWindow(QMainWindow):
                 schedule_id,
                 "network",
             )
+        reset_idle_ids = set(restart_ids) | (previous_ids - set(schedules_by_id))
+        for schedule_id, schedule in schedules_by_id.items():
+            previous = previous_by_id.get(schedule_id)
+            if previous is None or any(
+                getattr(previous, field_name) != getattr(schedule, field_name)
+                for field_name in (
+                    "enabled",
+                    "use_time",
+                    "trigger_mode",
+                    "weekdays",
+                    "idle_minutes",
+                    "require_idle",
+                )
+            ):
+                reset_idle_ids.add(schedule_id)
+        for schedule_id in reset_idle_ids:
+            self.condition_engine.runtime.clear_idle_cycle_triggered(schedule_id)
+            self.condition_engine.runtime.clear_idle_snooze(schedule_id)
         for dlg in list(self.active_dialogs.values()):
             dialog_schedule = getattr(dlg, "schedule", None)
             schedule_id = getattr(dialog_schedule, "id", None)
@@ -2238,6 +2538,18 @@ class MainWindow(QMainWindow):
         self.config["schedules"] = [schedule_to_dict(s) for s in schedules]
         save_json(CONFIG_FILE, self.config)
 
+        changed_enabled_ids = {
+            schedule_id
+            for schedule_id, schedule in schedules_by_id.items()
+            if (
+                schedule_id in previous_by_id
+                and previous_by_id[schedule_id].enabled != schedule.enabled
+            )
+        }
+        state_changed = False
+        for schedule_id in changed_enabled_ids:
+            if self.state.get("snoozes", {}).pop(schedule_id, None) is not None:
+                state_changed = True
         for schedule_id in removed_ids:
             for state_key in (
                 "last_runs",
@@ -2246,14 +2558,15 @@ class MainWindow(QMainWindow):
                 "pending_occurrences",
                 "completed_intervals",
             ):
-                self.state.get(state_key, {}).pop(schedule_id, None)
+                if self.state.get(state_key, {}).pop(schedule_id, None) is not None:
+                    state_changed = True
 
         self._reconcile_schedule_occurrences(
             schedules,
             restart_interval_ids=restart_interval_ids,
             now=now,
         )
-        if removed_ids:
+        if state_changed:
             save_json(STATE_FILE, self.state)
         self.refresh_list()
 
@@ -4775,6 +5088,9 @@ class IpcServer:
     def __init__(self, window):
         self.window = window
         self.server = QLocalServer(window)
+        self.server.setSocketOptions(QLocalServer.UserAccessOption)
+        self._buffers = {}
+        self._connection_timers = {}
         QLocalServer.removeServer(IPC_NAME)
         if self.server.listen(IPC_NAME):
             self.server.newConnection.connect(self.handle_connection)
@@ -4785,46 +5101,271 @@ class IpcServer:
         sock = self.server.nextPendingConnection()
         if not sock:
             return
-        if sock.waitForReadyRead(300):
-            cmd = bytes(sock.readAll()).decode("utf-8", "replace").strip()
-            if cmd == "show":
-                self.window.show_normal()
-            elif cmd == "check-update":
-                self.window.check_updates(manual=True)
+        self._buffers[sock] = bytearray()
+        sock.readyRead.connect(lambda current=sock: self._read_connection(current))
+        sock.disconnected.connect(lambda current=sock: self._forget_connection(current))
+        try:
+            timer = QTimer(self.server)
+            timer.setSingleShot(True)
+            timer.timeout.connect(
+                lambda current=sock: self._expire_connection(current)
+            )
+            timer.start(IPC_TIMEOUT_MS)
+            self._connection_timers[sock] = timer
+        except TypeError:
+            pass
+        self._read_connection(sock)
+
+    def _read_connection(self, sock):
+        buffer = self._buffers.get(sock)
+        if buffer is None:
+            return
+        available = int(sock.bytesAvailable())
+        if available <= 0:
+            return
+        if len(buffer) + available > IPC_MAX_REQUEST_BYTES:
+            self._write_response(
+                sock,
+                {
+                    "ok": False,
+                    "code": 2,
+                    "output": "Solicitud IPC demasiado grande.",
+                },
+            )
+            self._finish_connection(sock)
+            return
+        buffer.extend(bytes(sock.readAll()))
+        stripped = bytes(buffer).lstrip()
+        if not stripped:
+            return
+        if stripped.startswith(b"{"):
+            if b"\n" not in buffer:
+                return
+            raw, trailing = bytes(buffer).split(b"\n", 1)
+            if trailing.strip():
+                response = {
+                    "ok": False,
+                    "code": 2,
+                    "output": "Solo se permite una solicitud por conexión.",
+                }
+            else:
+                response = self._handle_structured_request(raw)
+            self._write_response(sock, response)
+            self._finish_connection(sock)
+            return
+
+        command = bytes(buffer).decode("utf-8", "replace").strip()
+        if command == "show":
+            self.window.show_normal()
+        elif command == "check-update":
+            self.window.check_updates(manual=True)
+        else:
+            return
+        self._finish_connection(sock)
+
+    def _finish_connection(self, sock):
+        self._buffers.pop(sock, None)
+        timer = self._connection_timers.pop(sock, None)
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
         sock.disconnectFromServer()
 
+    def _forget_connection(self, sock):
+        self._buffers.pop(sock, None)
+        timer = self._connection_timers.pop(sock, None)
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+        try:
+            sock.deleteLater()
+        except RuntimeError:
+            pass
 
-def send_ipc(command: str):
+    def _expire_connection(self, sock):
+        if sock not in self._buffers:
+            return
+        self._write_response(
+            sock,
+            {
+                "ok": False,
+                "code": 1,
+                "output": "La solicitud IPC no se completó a tiempo.",
+            },
+        )
+        self._finish_connection(sock)
+
+
+    def _handle_structured_request(self, raw):
+        try:
+            request = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return {"ok": False, "code": 2, "output": "Solicitud IPC inválida."}
+        if not isinstance(request, dict) or request.get("version") != 1:
+            return {"ok": False, "code": 2, "output": "Protocolo IPC inválido."}
+        command = request.get("command")
+        target = request.get("target")
+        if not isinstance(command, str) or (
+            target is not None and not isinstance(target, str)
+        ):
+            return {"ok": False, "code": 2, "output": "Argumentos IPC inválidos."}
+        return self.window.handle_cli_command(command, target)
+
+    def _write_response(self, sock, response):
+        payload = json.dumps(
+            response,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        sock.write(payload)
+        sock.flush()
+        sock.waitForBytesWritten(100)
+
+
+def _ipc_client_error(output):
+    return {"ok": False, "code": 1, "output": output}
+
+
+def send_ipc(command: str, target=None, expect_response=False):
     sock = QLocalSocket()
     sock.connectToServer(IPC_NAME)
-    if not sock.waitForConnected(300):
-        return False
-    sock.write(command.encode("utf-8"))
+    if not sock.waitForConnected(IPC_TIMEOUT_MS):
+        return None if expect_response else False
+    if expect_response:
+        payload = json.dumps(
+            {"version": 1, "command": command, "target": target},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+    else:
+        payload = command.encode("utf-8")
+    sock.write(payload)
     sock.flush()
-    sock.waitForBytesWritten(300)
+    sock.waitForBytesWritten(IPC_TIMEOUT_MS)
+    if expect_response:
+        response_data = bytearray()
+        deadline = time.monotonic() + (IPC_TIMEOUT_MS / 1000)
+        while b"\n" not in response_data:
+            available = int(sock.bytesAvailable())
+            if available:
+                if len(response_data) + available > IPC_MAX_RESPONSE_BYTES:
+                    sock.disconnectFromServer()
+                    return _ipc_client_error("Respuesta IPC demasiado grande.")
+                response_data.extend(bytes(sock.readAll()))
+                continue
+            remaining_ms = int(max(0, deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                sock.disconnectFromServer()
+                return _ipc_client_error(
+                    "La instancia aceptó la conexión, pero no respondió; "
+                    "el resultado de la operación es desconocido."
+                )
+            if not sock.waitForReadyRead(remaining_ms):
+                if int(sock.bytesAvailable()) > 0:
+                    continue
+                sock.disconnectFromServer()
+                return _ipc_client_error(
+                    "La instancia aceptó la conexión, pero no respondió; "
+                    "el resultado de la operación es desconocido."
+                )
+        frame, trailing = bytes(response_data).split(b"\n", 1)
+        if trailing.strip():
+            sock.disconnectFromServer()
+            return _ipc_client_error("Respuesta IPC inválida.")
+        try:
+            response = json.loads(frame.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            sock.disconnectFromServer()
+            return _ipc_client_error("Respuesta IPC inválida.")
+        if (
+            not isinstance(response, dict)
+            or not isinstance(response.get("ok"), bool)
+            or type(response.get("code")) is not int
+            or not isinstance(response.get("output"), str)
+        ):
+            sock.disconnectFromServer()
+            return _ipc_client_error("Respuesta IPC inválida.")
+        sock.disconnectFromServer()
+        return response
     sock.disconnectFromServer()
     return True
 
 
-def main():
-    ensure_dirs()
-    if "--version" in sys.argv:
-        print(APP_VERSION)
-        return 0
+def send_ipc_with_retry(command, target=None, expect_response=False):
+    unavailable = None if expect_response else False
+    for attempt in range(8):
+        response = send_ipc(command, target, expect_response)
+        if response is not unavailable:
+            return response
+        if attempt < 7:
+            time.sleep(0.2)
+    return unavailable
 
+
+def _print_cli_response(response):
+    output = response.get("output", "")
+    if output:
+        stream = sys.stdout if response.get("ok") else sys.stderr
+        print(output, file=stream)
+    return int(response.get("code", 1))
+
+
+def _offline_query(command):
+    config = load_json(CONFIG_FILE, DEFAULT_CONFIG)
+    state = load_json(STATE_FILE, DEFAULT_STATE)
+    schedules = schedules_from_config(config)
+    if command == "status":
+        output = format_status_cli(
+            config,
+            state,
+            schedules,
+            ipc_available=False,
+        )
+    else:
+        output = format_schedules_cli(schedules, state)
+    return {"ok": True, "code": 0, "output": output}
+
+
+def main(argv=None):
+    cli_argv = sys.argv[1:] if argv is None else list(argv)
+    args = build_cli_parser().parse_args(cli_argv)
+    command, target = cli_command_from_args(args)
+
+    administrative = {
+        "hide",
+        "toggle",
+        "status",
+        "list-schedules",
+        "enable",
+        "disable",
+    }
+    if command in administrative:
+        response = send_ipc_with_retry(command, target, expect_response=True)
+        if response is not None:
+            return _print_cli_response(response)
+        if command in ("status", "list-schedules"):
+            return _print_cli_response(_offline_query(command))
+        print(
+            "AMP AutoPower debe estar ejecutándose y accesible por IPC.",
+            file=sys.stderr,
+        )
+        return 1
+
+    ensure_dirs()
     configure_qt_system_theme()
-    app = QApplication(sys.argv)
+    qt_argv = sys.argv if argv is None else [sys.argv[0], *cli_argv]
+    app = QApplication(qt_argv)
     app._system_palette_fallback = apply_system_palette_fallback(app)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName("Local")
     app.setQuitOnLastWindowClosed(False)
 
-    command = "check-update" if "--check-update" in sys.argv else "show"
+    existing_command = command if command == "check-update" else "show"
     lock_path = str(Path(QStandardPaths.writableLocation(QStandardPaths.TempLocation)) / "amp-autopower.lock")
     lock = QLockFile(lock_path)
     lock.setStaleLockTime(0)
     if not lock.tryLock(50):
-        if send_ipc(command):
+        if send_ipc_with_retry(existing_command):
             return 0
         QMessageBox.information(None, APP_NAME, "AMP AutoPower ya está ejecutándose, pero no se pudo contactar con su ventana. Prueba a reiniciar el servicio.")
         return 1
@@ -4834,11 +5375,11 @@ def main():
     window._ipc = ipc
     if not window.config.get("tray_visible", True):
         window.set_tray_visible(False)
-    if not window.config.get("start_minimized", True) or "--show" in sys.argv:
+    if not window.config.get("start_minimized", True) or command == "show":
         window.show()
     else:
         window.hide()
-    if "--check-update" in sys.argv:
+    if command == "check-update":
         QTimer.singleShot(1000, lambda: window.check_updates(manual=True))
     log(f"Aplicación iniciada v{APP_VERSION}")
     rc = app.exec()
