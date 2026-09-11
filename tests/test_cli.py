@@ -535,6 +535,7 @@ class IpcProtocolTests(unittest.TestCase):
         socket_name = f"amp-autopower-test-{uuid.uuid4().hex}"
         server_code = """
 import os
+import sys
 from PySide6.QtCore import QCoreApplication, QObject, QTimer
 import amp_autopower as amp
 
@@ -552,6 +553,9 @@ class Window(QObject):
 
 window = Window()
 server = amp.IpcServer(window)
+if not server.server.isListening():
+    print("unavailable", flush=True)
+    sys.exit(77)
 print("ready", flush=True)
 QTimer.singleShot(5000, app.quit)
 app.exec()
@@ -567,7 +571,11 @@ app.exec()
             text=True,
         )
         try:
-            self.assertEqual(server.stdout.readline().strip(), "ready")
+            readiness = server.stdout.readline().strip()
+            if readiness == "unavailable":
+                server.communicate(timeout=3)
+                self.skipTest("QLocalServer no puede escuchar en este entorno")
+            self.assertEqual(readiness, "ready")
             with patch("amp_autopower.IPC_NAME", socket_name):
                 response = amp.send_ipc(
                     "disable",

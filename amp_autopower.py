@@ -4251,8 +4251,6 @@ class MainWindow(QMainWindow):
             self._execute_final_action(s, target)
             return
 
-        if schedule_trigger_mode(s) != "interval":
-            self.mark_skipped(s, target)
         self.notify(
             "Acción cancelada",
             f"El programa previo falló y la acción no se ejecutará.\n\n{reason}",
@@ -4515,18 +4513,14 @@ class MainWindow(QMainWindow):
                 True,
             )
             return False
-        if is_interval:
-            self._record_action_completion(s, target)
+        self._record_action_completion(s, target)
         return True
 
     def _execute_final_action(self, s, target):
         is_interval = schedule_trigger_mode(s) == "interval"
-        if not is_interval:
-            self._record_action_completion(s, target)
 
         if s.action == "test":
-            if is_interval:
-                self._record_action_completion(s, target)
+            self._record_action_completion(s, target)
             self.notify(
                 "Prueba completada",
                 "El aviso y la cuenta regresiva funcionan correctamente.",

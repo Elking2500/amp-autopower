@@ -2031,7 +2031,7 @@ class SchedulerCompatibilityTests(unittest.TestCase):
         with (
             patch("amp_autopower.QProcess", FakeProcess),
             patch("amp_autopower.QTimer", FakeTimer),
-            patch("amp_autopower.save_json"),
+            patch("amp_autopower.save_json") as save,
         ):
             harness.execute_action(item, target)
             process = FakeProcess.instances[0]
@@ -2043,8 +2043,10 @@ class SchedulerCompatibilityTests(unittest.TestCase):
 
             process.process_state = FakeProcess.NotRunning
             process.finished.emit(0, None)
+            process.finished.emit(0, None)
 
         self.assertEqual(state["last_runs"][item.id], target.isoformat())
+        save.assert_called_once()
         self.assertTrue(process.deleted)
         self.assertEqual(harness._pre_action_processes, {})
 
@@ -2101,11 +2103,14 @@ class SchedulerCompatibilityTests(unittest.TestCase):
 
         for policy in ("cancel", "continue"):
             with self.subTest(policy=policy):
+                occurrence = ScheduledOccurrence.create(policy, target, 60)
                 state = {
                     "last_runs": {},
                     "snoozes": {},
                     "skipped_targets": {},
-                    "pending_occurrences": {},
+                    "pending_occurrences": {
+                        policy: occurrence.to_state(),
+                    },
                     "completed_intervals": {},
                 }
                 harness = SchedulerHarness(state)
@@ -2130,10 +2135,14 @@ class SchedulerCompatibilityTests(unittest.TestCase):
                     process.process_state = FakeProcess.NotRunning
                     process.finished.emit(7, None)
 
-                expected = target.isoformat()
                 if policy == "cancel":
-                    expected += ":skipped"
-                self.assertEqual(state["last_runs"][item.id], expected)
+                    self.assertNotIn(item.id, state["last_runs"])
+                    self.assertIn(item.id, state["pending_occurrences"])
+                else:
+                    self.assertEqual(
+                        state["last_runs"][item.id],
+                        target.isoformat(),
+                    )
                 self.assertTrue(
                     any(
                         "simulated command failure" in args[1]
@@ -2171,10 +2180,7 @@ class SchedulerCompatibilityTests(unittest.TestCase):
             process.process_state = FakeProcess.NotRunning
             process.errorOccurred.emit("FailedToStart")
 
-        self.assertEqual(
-            state["last_runs"][item.id],
-            target.isoformat() + ":skipped",
-        )
+        self.assertNotIn(item.id, state["last_runs"])
         self.assertIn("No such file", harness.notifications[-1][0][1])
 
     def test_editing_schedule_cancels_stale_running_pre_action(self):
@@ -2459,11 +2465,8 @@ class SchedulerCompatibilityTests(unittest.TestCase):
         ):
             harness.execute_action(item, target)
 
-        self.assertEqual(
-            state["last_runs"][item.id],
-            target.isoformat() + ":skipped",
-        )
-        self.assertEqual(state["skipped_targets"][item.id], target.isoformat())
+        self.assertNotIn(item.id, state["last_runs"])
+        self.assertNotIn(item.id, state["skipped_targets"])
         self.assertIn("simulated start failure", harness.notifications[-1][0][1])
 
     def test_session_action_falls_back_to_gdbus_then_loginctl(self):
@@ -2609,6 +2612,104 @@ class SchedulerCompatibilityTests(unittest.TestCase):
 
                 harness._close_chrome_cleanly.assert_called_once_with()
                 self.assertEqual(command.call_args.args[0][-1], method)
+
+    def test_failed_timed_action_does_not_consume_occurrence(self):
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        item = Schedule(
+            id="timed-failure",
+            action="suspend",
+            close_apps_first=False,
+        )
+        target = datetime(2026, 8, 31, 12, 0)
+        failure = SimpleNamespace(
+            returncode=1,
+            stderr="simulated failure",
+            stdout="",
+        )
+
+        with (
+            patch("amp_autopower.run_cmd", return_value=failure),
+            patch("amp_autopower.save_json"),
+        ):
+            harness.execute_action(item, target)
+
+        self.assertNotIn(item.id, state["last_runs"])
+
+    def test_failed_timed_session_and_chrome_do_not_consume_occurrence(self):
+        target = datetime(2026, 8, 31, 12, 0)
+
+        for action, chrome_ok in (("logout", True), ("poweroff", False)):
+            with self.subTest(action=action):
+                state = {
+                    "last_runs": {},
+                    "snoozes": {},
+                    "skipped_targets": {},
+                    "pending_occurrences": {},
+                    "completed_intervals": {},
+                }
+                harness = SchedulerHarness(state)
+                harness._session_action_command = MagicMock(
+                    return_value=["/usr/bin/qdbus6", "mock-method"]
+                )
+                harness._close_chrome_cleanly = MagicMock(
+                    return_value=chrome_ok
+                )
+                item = Schedule(
+                    id=f"timed-{action}-failure",
+                    action=action,
+                    close_apps_first=True,
+                )
+
+                with (
+                    patch(
+                        "amp_autopower.run_cmd",
+                        return_value=SimpleNamespace(
+                            returncode=1,
+                            stderr="simulated DBus failure",
+                            stdout="",
+                        ),
+                    ),
+                    patch("amp_autopower.save_json"),
+                ):
+                    harness.execute_action(item, target)
+
+                self.assertNotIn(item.id, state["last_runs"])
+
+    def test_early_or_failure_retries_with_original_scheduled_target(self):
+        target = datetime(2026, 8, 31, 23, 30)
+        state = {
+            "last_runs": {},
+            "snoozes": {},
+            "skipped_targets": {},
+            "pending_occurrences": {},
+            "completed_intervals": {},
+        }
+        harness = SchedulerHarness(state)
+        item = Schedule(
+            id="timed-or-retry",
+            action="suspend",
+            condition_logic="OR",
+            require_cpu=True,
+        )
+        failure = SimpleNamespace(returncode=1, stderr="failure", stdout="")
+        success = SimpleNamespace(returncode=0, stderr="", stdout="")
+
+        with (
+            patch("amp_autopower.run_cmd", side_effect=(failure, success)),
+            patch("amp_autopower.save_json"),
+        ):
+            harness.execute_action(item, target)
+            self.assertNotIn(item.id, state["last_runs"])
+            harness.execute_action(item, target)
+
+        self.assertEqual(state["last_runs"][item.id], target.isoformat())
 
     def test_chrome_clean_close_sends_sighup_to_main_process(self):
         state = {

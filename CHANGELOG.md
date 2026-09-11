@@ -2,19 +2,11 @@
 
 ## 2.0.0-dev (en desarrollo)
 
-- Soporte en desarrollo para condiciones de actividad de red.
-- Soporte en desarrollo para combinar condiciones mediante AND/OR.
-- Display compacto configurable con estado de programaciones y condiciones.
-- Nuevas acciones para cerrar o bloquear la sesión y programas previos configurables antes de cualquier acción.
-- Preferencias globales para bandeja, display y atajo KDE, con comando opcional al cancelar una programación.
-- CLI administrativa segura para consultar estado y activar o desactivar programaciones mediante IPC.
-
-## 1.4.0-dev (en desarrollo)
-
-- Preparación interna de un motor extensible de condiciones.
-- Las condiciones existentes de hora e inactividad se evalúan mediante la nueva capa sin cambiar la configuración ni la interfaz de v1.3.0.
-- Soporte en desarrollo para programaciones one-shot basadas en intervalo.
-- Soporte en desarrollo para condiciones de uso de CPU.
+- Nuevo motor para condiciones de hora, intervalo one-shot, inactividad, CPU y red, combinables mediante AND/OR y con ocurrencias pendientes persistentes.
+- Display compacto negro/verde configurable, editor de programaciones por pestañas e integración con el tema de KDE.
+- Nuevas acciones para cerrar o bloquear la sesión, programas previos configurables y comando opcional al cancelar.
+- Preferencias globales para display y bandeja, con atajo real de KGlobalAccel en Plasma Wayland.
+- CLI administrativa segura para mostrar u ocultar la ventana, consultar estado y activar o desactivar programaciones mediante IPC.
 
 ## 1.3.0
 
