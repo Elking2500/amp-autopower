@@ -81,7 +81,34 @@ except Exception:
 
 APP_NAME = "AMP AutoPower"
 APP_ID = "amp-autopower"
-APP_VERSION = "1.3.0"
+
+
+def _valid_version_value(value):
+    value = str(value or "").strip()
+    if re.fullmatch(
+        r"[0-9]+(?:\.[0-9]+)*(?:[-+][0-9A-Za-z.-]+)?",
+        value,
+    ):
+        return value
+    return None
+
+
+def load_app_version(version_path=None):
+    path = (
+        Path(version_path)
+        if version_path is not None
+        else Path(__file__).resolve().with_name("VERSION")
+    )
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "unknown"
+    if len(value) > 64 or _valid_version_value(value) is None:
+        return "unknown"
+    return value
+
+
+APP_VERSION = load_app_version()
 IPC_NAME = "amp-autopower-ipc-v1"
 IPC_TIMEOUT_MS = 2000
 IPC_MAX_REQUEST_BYTES = 16 * 1024
@@ -356,7 +383,12 @@ def version_tuple(value: str):
     return tuple(int(x) for x in nums) + (0,) * (4 - len(nums))
 
 
-def is_newer_version(candidate: str, current: str = APP_VERSION):
+def is_newer_version(candidate: str, current=None):
+    current = APP_VERSION if current is None else str(current)
+    if _valid_version_value(candidate) is None:
+        return False
+    if _valid_version_value(current) is None:
+        return False
     return version_tuple(candidate) > version_tuple(current)
 
 
