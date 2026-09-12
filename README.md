@@ -5,29 +5,24 @@ Aplicación de apagado y acciones de energía programadas para CachyOS/Arch Linu
 ## Funciones
 
 - Varias programaciones independientes.
-- Apagar, reiniciar, suspender, hibernar y modo de prueba.
+- Apagar, reiniciar, suspender, hibernar, cerrar sesión, bloquear sesión y modo de prueba.
 - Días de la semana configurables.
-- Hora programada opcional para cada programación.
-- Programaciones exclusivamente por inactividad, sin una hora fija.
-- Tiempo mínimo de inactividad configurable por programación.
+- Programaciones por hora, intervalo one-shot o exclusivamente por inactividad.
+- Condiciones de inactividad, CPU y red combinables mediante lógica **AND/OR**.
 - Avisos a 30, 15, 5 y 1 minuto cuando se usa una hora programada.
 - Cuenta regresiva final con **Cancelar**, **Posponer 10 min** y **Posponer 30 min**.
 - Cierre seguro de aplicaciones antes de apagar o reiniciar.
 - Cierre limpio de Google Chrome para conservar ventanas y pestañas.
 - Notificaciones y sonido.
-- Icono en la bandeja de KDE.
+- Display compacto negro/verde con transparencia y formato de 12/24 horas.
+- Icono en la bandeja de KDE configurable.
+- Atajo global mediante KGlobalAccel en Plasma Wayland.
+- Comando previo opcional con timeout y política de fallo, y comando opcional al cancelar.
 - Inicio automático con `systemd --user`.
 - Registro de actividad y respaldos antes de actualizar.
 - Búsqueda de actualizaciones cada 48 horas.
 - Actualización manual o por Internet con verificación SHA-256.
 - El actualizador espera a que pulses **OK** antes de reiniciar AMP AutoPower.
-
-## Novedades de 1.1.1
-
-- Canal oficial de actualizaciones conectado a este repositorio de GitHub.
-- El `manifest.json` oficial se configura automáticamente.
-- Migración de configuraciones 1.1.0 que tenían la URL del canal vacía.
-- Se mantienen intactos los horarios y preferencias existentes.
 
 ## Instalación en CachyOS / Arch
 
@@ -54,6 +49,20 @@ El paquete descargado solo se instala si su SHA-256 coincide con el publicado en
 
 Cuando una actualización termina correctamente, AMP AutoPower muestra la confirmación primero y reinicia la aplicación únicamente después de que pulses **OK**.
 
+## CLI
+
+```bash
+amp-autopower --show
+amp-autopower --hide
+amp-autopower --toggle
+amp-autopower --status
+amp-autopower --list-schedules
+amp-autopower --enable ID_O_NOMBRE
+amp-autopower --disable ID_O_NOMBRE
+```
+
+Las órdenes de interfaz y administración se envían a la instancia en ejecución mediante IPC. Las consultas de estado y programaciones también funcionan sin conexión.
+
 ## Servicio
 
 ```bash
@@ -76,26 +85,10 @@ Instalación de usuario:
 
 `~/.local/share/amp-autopower/`
 
-## v1.3.0 — Inactividad sin hora, cierre seguro y actualizador mejorado
+## AMP AutoPower 2.0.0
 
-- Cada programación puede activar o desactivar **Usar hora programada**.
-- Si la hora está desactivada, la programación puede ejecutarse exclusivamente después del tiempo mínimo de inactividad.
-- Las programaciones por inactividad se rearman después de nueva actividad para evitar ejecuciones repetidas durante el mismo periodo inactivo.
-- **Cancelar** y **Posponer** siguen disponibles durante la cuenta regresiva final.
-- En apagado y reinicio puede activarse **Cerrar aplicaciones correctamente antes de apagar/reiniciar**.
-- Plasma realiza el cierre seguro mediante `logoutAndShutdown` o `logoutAndReboot`.
-- Google Chrome recibe primero una solicitud de salida limpia mediante `SIGHUP`, únicamente en sus procesos principales.
-- No se envía la señal directamente a procesos renderer, GPU, utility o zygote de Chrome.
-- AMP AutoPower espera hasta 15 segundos a que Chrome termine correctamente.
-- Si Chrome no termina dentro de ese tiempo, el apagado o reinicio se cancela en lugar de forzar el cierre.
-- El estado de ventanas y pestañas de Chrome puede restaurarse normalmente en el siguiente inicio.
-- El actualizador instala primero la nueva versión, muestra el resultado y reinicia AMP AutoPower únicamente después de pulsar **OK**.
-- El servicio espera a que el socket de Wayland exista antes de iniciar Qt, evitando fallos de arranque cuando la sesión gráfica todavía no está preparada.
+El motor conserva las ocurrencias pendientes y solo registra una ejecución cuando la acción termina correctamente. Las programaciones por intervalo son de una sola ejecución; las condiciones de hora, inactividad, CPU y red pueden combinarse con AND u OR.
 
-## v1.2.2 — Juegos fullscreen e inactividad global
+El editor separa activación, condiciones, acción y avisos en pestañas. La cuenta regresiva permite cancelar o posponer, y el display compacto puede permanecer visible con la transparencia y el formato horario elegidos.
 
-- Overlay de emergencia sobre juegos y pantalla completa.
-- Avisos previos keep-above.
-- Monitor global evdev para mouse, teclado, touch y mandos USB/Bluetooth/wireless.
-- Cada programación puede exigir minutos mínimos de inactividad.
-- No se registran teclas, botones ni coordenadas; solo tiempo de última actividad.
+Las configuraciones y el estado de 1.3.0 se cargan automáticamente con valores seguros para las opciones nuevas.

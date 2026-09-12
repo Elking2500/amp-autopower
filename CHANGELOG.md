@@ -1,12 +1,20 @@
 # Changelog
 
-## 2.0.0-dev (en desarrollo)
+## 2.0.0
 
-- Nuevo motor para condiciones de hora, intervalo one-shot, inactividad, CPU y red, combinables mediante AND/OR y con ocurrencias pendientes persistentes.
-- Display compacto negro/verde configurable, editor de programaciones por pestañas e integración con el tema de KDE.
-- Nuevas acciones para cerrar o bloquear la sesión, programas previos configurables y comando opcional al cancelar.
-- Preferencias globales para display y bandeja, con atajo real de KGlobalAccel en Plasma Wayland.
-- CLI administrativa segura para mostrar u ocultar la ventana, consultar estado y activar o desactivar programaciones mediante IPC.
+- Nuevo motor de condiciones con programaciones por hora o intervalo one-shot y condiciones de inactividad, CPU y red combinables mediante lógica AND/OR.
+- Ocurrencias pendientes persistentes para conservar el objetivo programado mientras se cumplen las condiciones, incluso al cruzar medianoche.
+- Correcciones de Cancelar y Posponer, con opciones de 10 o 30 minutos y protección frente a cuentas regresivas duplicadas.
+- Las acciones fallidas ya no consumen la ocurrencia ni se registran incorrectamente en `last_runs`; los intervalos solo se completan tras un resultado satisfactorio.
+- Display compacto negro/verde inspirado en WinOFF, con transparencia, formato de 12/24 horas, posición persistente e integración con el tema de KDE.
+- Editor de programaciones reorganizado por pestañas.
+- Nuevas acciones para cerrar sesión y bloquear la sesión.
+- Comando previo opcional con espera, timeout y política de cancelar o continuar si falla.
+- Comando opcional al cancelar explícitamente una cuenta regresiva.
+- Preferencias globales para display, bandeja configurable, inicio minimizado y atajo real mediante KGlobalAccel en Plasma Wayland.
+- CLI administrativa con `--show`, `--hide`, `--toggle`, `--status`, `--list-schedules`, `--enable` y `--disable`.
+- IPC ampliado para controlar una única instancia sin iniciar un segundo scheduler.
+- Compatibilidad de configuración y estado al actualizar desde 1.3.0.
 
 ## 1.3.0
 
